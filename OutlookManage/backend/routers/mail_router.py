@@ -265,11 +265,24 @@ def direct_otp_query(req: DirectOtpRequest):
     return {"success": False, "error": "No OTP code found"}
 
 
+class StartAutoregRequest(BaseModel):
+    concurrent: Optional[int] = 1
+    tasks: Optional[int] = 5
+    email_suffix: Optional[str] = "@outlook.com"
+    headless: Optional[bool] = True
+
+
 # AutoReg router endpoints
 @autoreg_router.post("/start")
-def start_autoreg(concurrent: int = 1, tasks: Optional[int] = None):
+def start_autoreg(req: Optional[StartAutoregRequest] = None):
     """Start the Outlook auto-registration background process."""
-    return autoreg_mgr.start(concurrent=concurrent, tasks=tasks)
+    r = req or StartAutoregRequest()
+    return autoreg_mgr.start(
+        concurrent=r.concurrent or 1,
+        tasks=r.tasks or 5,
+        email_suffix=r.email_suffix or "@outlook.com",
+        headless=r.headless if r.headless is not None else True,
+    )
 
 
 @autoreg_router.post("/stop")
@@ -282,6 +295,16 @@ def stop_autoreg():
 def status_autoreg():
     """Get the current auto-registration worker status."""
     return autoreg_mgr.status()
+
+
+@autoreg_router.get("/logs")
+def get_autoreg_logs(limit: int = 150):
+    """Get live logs of the auto-registration process."""
+    return {
+        "success": True,
+        "lines": autoreg_mgr.get_logs(limit=limit),
+        "status": autoreg_mgr.status(),
+    }
 
 
 @autoreg_router.post("/sync")

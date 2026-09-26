@@ -1,9 +1,11 @@
 """Auto-Registration & Results Auto-Sync Service.
-Controls OutlookRegister process and automatically synchronizes generated accounts into SQLite.
+Controls OutlookRegister process, updates config, and provides live log streaming.
 """
 
 from __future__ import annotations
 
+import collections
+import json
 import os
 import subprocess
 import sys
@@ -15,6 +17,7 @@ from typing import Any, Optional
 ROOT = Path(__file__).resolve().parent.parent.parent
 REGISTER_DIR = ROOT.parent / "OutlookRegister"
 RESULTS_FILE = REGISTER_DIR / "Results" / "oauth2.txt"
+AUTOREG_LOG_FILE = ROOT / "logs" / "autoreg.log"
 
 
 class AutoRegManager:
@@ -22,9 +25,9 @@ class AutoRegManager:
         self._lock = threading.Lock()
         self._process: Optional[subprocess.Popen] = None
         self._is_running = False
-        self._last_line_offset = 0
         self._sync_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
+        self.log_lines: collections.deque[str] = collections.deque(maxlen=1000)
         self.stats = {
             "started_at": None,
             "registered_count": 0,
@@ -33,7 +36,13 @@ class AutoRegManager:
             "status": "idle",
         }
 
-    def start(self, concurrent: int = 1, tasks: Optional[int] = None) -> dict[str, Any]:
+    def start(
+        self,
+        concurrent: int = 1,
+        tasks: int = 5,
+        email_suffix: str = "@outlook.com",
+        headless: bool = True,
+    ) -> dict[str, Any]:
         with self._lock:
             if self._is_running and self._process and self._process.poll() is None:
                 return {"success": False, "error": "Auto-registration worker is already running"}
@@ -45,13 +54,31 @@ class AutoRegManager:
             if not main_script.exists():
                 return {"success": False, "error": f"main.py not found in {REGISTER_DIR}"}
 
+            # Update OutlookRegister/config.json with requested parameters
+            config_file = REGISTER_DIR / "config.json"
+            if not config_file.exists():
+                example = REGISTER_DIR / "config.example.json"
+                if example.exists():
+                    import shutil
+                    shutil.copy(example, config_file)
+
+            try:
+                cfg_data = json.loads(config_file.read_text(encoding="utf-8")) if config_file.exists() else {}
+                cfg_data["tasks"] = max(1, int(tasks or 5))
+                cfg_data["concurrent_flows"] = max(1, int(concurrent or 1))
+                cfg_data["email_suffix"] = email_suffix if email_suffix else "@outlook.com"
+                cfg_data["headless"] = bool(headless)
+                config_file.write_text(json.dumps(cfg_data, indent=2, ensure_ascii=False), encoding="utf-8")
+            except Exception as exc:
+                self.log_lines.append(f"[{time.strftime('%H:%M:%S')}] [WARN] Failed to write config.json: {exc}")
+
             self._stop_event.clear()
             self.stats["started_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
             self.stats["status"] = "running"
             self.stats["last_error"] = None
+            self.log_lines.append(f"[{time.strftime('%H:%M:%S')}] [INIT] Starting auto-registration: tasks={tasks}, concurrent={concurrent}, suffix={email_suffix}, headless={headless}")
 
             try:
-                # Launch registration process with current python interpreter
                 env = os.environ.copy()
                 env["PYTHONUNBUFFERED"] = "1"
                 self._process = subprocess.Popen(
@@ -65,15 +92,22 @@ class AutoRegManager:
                 )
                 self._is_running = True
 
-                # Start watcher thread for results & process output
+                # Start watcher thread for stdout & results
                 self._sync_thread = threading.Thread(target=self._monitor_loop, daemon=True)
                 self._sync_thread.start()
 
-                return {"success": True, "pid": self._process.pid, "status": "started"}
+                return {
+                    "success": True,
+                    "pid": self._process.pid,
+                    "status": "started",
+                    "tasks": tasks,
+                    "concurrent": concurrent,
+                }
             except Exception as exc:
                 self.stats["status"] = "error"
                 self.stats["last_error"] = str(exc)
                 self._is_running = False
+                self.log_lines.append(f"[{time.strftime('%H:%M:%S')}] [ERROR] Process launch failed: {exc}")
                 return {"success": False, "error": str(exc)}
 
     def stop(self) -> dict[str, Any]:
@@ -82,6 +116,7 @@ class AutoRegManager:
                 return {"success": True, "message": "Worker is not running"}
 
             self._stop_event.set()
+            self.log_lines.append(f"[{time.strftime('%H:%M:%S')}] [STOP] Stopping auto-registration worker (PID {self._process.pid})...")
             try:
                 if sys.platform == "win32":
                     subprocess.run(
@@ -101,6 +136,7 @@ class AutoRegManager:
             finally:
                 self._is_running = False
                 self.stats["status"] = "stopped"
+                self.log_lines.append(f"[{time.strftime('%H:%M:%S')}] [STOP] Worker stopped.")
 
             return {"success": True, "message": "Worker stopped"}
 
@@ -120,20 +156,40 @@ class AutoRegManager:
                 "pid": self._process.pid if (self._process and self._is_running) else None,
             }
 
+    def get_logs(self, limit: int = 150) -> list[str]:
+        limit = max(1, min(limit, 500))
+        lines = list(self.log_lines)
+        return lines[-limit:]
+
     def _monitor_loop(self) -> None:
-        """Read stdout to avoid pipe stall and continuously sync newly created accounts."""
-        while not self._stop_event.is_set():
-            if self._process and self._process.poll() is not None:
-                self._is_running = False
-                self.stats["status"] = "finished"
-                break
+        """Read stdout in real-time, buffer lines, and sync results."""
+        if not self._process or not self._process.stdout:
+            return
 
-            # Periodically sync results file
+        try:
+            AUTOREG_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            for line in iter(self._process.stdout.readline, ""):
+                if not line:
+                    break
+                clean = line.strip()
+                if clean:
+                    entry = f"[{time.strftime('%H:%M:%S')}] {clean}"
+                    self.log_lines.append(entry)
+                    try:
+                        with open(AUTOREG_LOG_FILE, "a", encoding="utf-8") as f:
+                            f.write(entry + "\n")
+                    except Exception:
+                        pass
+                self.sync_results()
+
+            self._process.stdout.close()
+        except Exception as exc:
+            self.log_lines.append(f"[{time.strftime('%H:%M:%S')}] [LOG ERR] {exc}")
+        finally:
+            self._is_running = False
+            self.stats["status"] = "finished"
+            self.log_lines.append(f"[{time.strftime('%H:%M:%S')}] [FINISH] Auto-registration process completed.")
             self.sync_results()
-            time.sleep(3)
-
-        # Final sync
-        self.sync_results()
 
     def sync_results(self) -> int:
         """Scan Results/oauth2.txt and insert any newly registered accounts into accounts.db."""
@@ -160,7 +216,6 @@ class AutoRegManager:
                     email_addr, password, client_id = parts[:3]
                     refresh_token = "----".join(parts[3:]).strip()
 
-                    # Check if already in DB
                     cursor.execute("SELECT id FROM accounts WHERE email = ?", (email_addr,))
                     row = cursor.fetchone()
                     if row is None:
@@ -187,6 +242,7 @@ class AutoRegManager:
                         )
                         imported_now += 1
                         self.stats["registered_count"] += 1
+                        self.log_lines.append(f"[{time.strftime('%H:%M:%S')}] [DB] Auto-imported new account: {email_addr}")
 
                 conn.commit()
         except Exception as exc:

@@ -1,16 +1,58 @@
-// Frontend Application Logic for Outlook Webmail on Vercel
+// Complete Application Controller: Firebase Auth Whitelist, Webmail, OTP Viewer, and Autoreg Console
 
+const WHITELIST_EMAIL = "greenyarik0505@gmail.com";
+
+// --- Firebase Configuration ---
+const firebaseConfig = {
+  projectId: "marvel-quiz-260920",
+  appId: "1:12875503898:web:6b3d6e98f05f1389bb74a3",
+  storageBucket: "marvel-quiz-260920.firebasestorage.app",
+  apiKey: "AIzaSyBKKsrW_Jzj4PC46MRpwBLFnr3RT1ihEo4",
+  authDomain: "marvel-quiz-260920.firebaseapp.com",
+  messagingSenderId: "12875503898",
+};
+
+let auth = null;
+let googleProvider = null;
+try {
+  firebase.initializeApp(firebaseConfig);
+  auth = firebase.auth();
+  googleProvider = new firebase.auth.GoogleAuthProvider();
+} catch (e) {
+  console.error("Firebase init error:", e);
+}
+
+// --- Application State ---
 let state = {
+  user: null,
+  currentView: "mail", // "mail" or "autoreg"
   accounts: [],
   currentAccount: null,
   currentFolder: "inbox",
   messages: [],
   currentMessage: null,
-  backendUrl: localStorage.getItem("outlook_backend_url") || "",
+  backendUrl: localStorage.getItem("outlook_backend_url") || "https://outlook-backend-cgy5.onrender.com",
   refreshTimer: null,
+  autoregTimer: null,
+  lastLogLength: 0,
 };
 
 // --- DOM Elements ---
+const authOverlay = document.getElementById("auth-overlay");
+const authErrorMsg = document.getElementById("auth-error-msg");
+const btnGoogleLogin = document.getElementById("btn-google-login");
+const appContainer = document.getElementById("app-container");
+const sidebarUserAvatar = document.getElementById("sidebar-user-avatar");
+const sidebarUserName = document.getElementById("sidebar-user-name");
+const sidebarUserEmail = document.getElementById("sidebar-user-email");
+const btnLogout = document.getElementById("btn-logout");
+
+const tabNavMail = document.getElementById("tab-nav-mail");
+const tabNavAutoreg = document.getElementById("tab-nav-autoreg");
+const viewMailWrapper = document.getElementById("view-mail-wrapper");
+const viewAutoregWrapper = document.getElementById("view-autoreg-wrapper");
+
+// Mail Elements
 const accountsContainer = document.getElementById("accounts-container");
 const messagesContainer = document.getElementById("messages-container");
 const viewEmpty = document.getElementById("view-empty");
@@ -30,25 +72,248 @@ const searchInput = document.getElementById("search-input");
 const autoRefreshSelect = document.getElementById("auto-refresh-select");
 const badgeInbox = document.getElementById("badge-inbox");
 
+// Autoreg Elements
+const metricStatus = document.getElementById("metric-status");
+const metricRegistered = document.getElementById("metric-registered");
+const metricTasks = document.getElementById("metric-tasks");
+const metricPid = document.getElementById("metric-pid");
+const inputAutoregTasks = document.getElementById("input-autoreg-tasks");
+const inputAutoregConcurrent = document.getElementById("input-autoreg-concurrent");
+const inputAutoregSuffix = document.getElementById("input-autoreg-suffix");
+const btnStartAutoreg = document.getElementById("btn-start-autoreg");
+const btnStopAutoreg = document.getElementById("btn-stop-autoreg");
+const btnSyncDbNow = document.getElementById("btn-sync-db-now");
+const terminalBody = document.getElementById("terminal-body");
+const checkAutoscroll = document.getElementById("check-autoscroll");
+const btnClearTerminal = document.getElementById("btn-clear-terminal");
+const autoregActionStatus = document.getElementById("autoreg-action-status");
+
 // --- Initialization ---
 document.addEventListener("DOMContentLoaded", () => {
+  setupAuth();
   loadLocalAccounts();
   setupEventListeners();
   updateLucide();
-
-  if (state.backendUrl) {
-    document.getElementById("input-backend-url").value = state.backendUrl;
-    syncAccountsFromBackend();
-  } else if (state.accounts.length > 0) {
-    selectAccount(state.accounts[0]);
-  }
-
   setupAutoRefresh();
+
+  if (document.getElementById("input-backend-url")) {
+    document.getElementById("input-backend-url").value = state.backendUrl;
+  }
 });
 
 function updateLucide() {
   if (window.lucide) {
     window.lucide.createIcons();
+  }
+}
+
+// --- Firebase Google Auth & Whitelist Logic ---
+function setupAuth() {
+  if (!auth) return;
+
+  btnGoogleLogin.addEventListener("click", async () => {
+    authErrorMsg.style.display = "none";
+    try {
+      const result = await auth.signInWithPopup(googleProvider);
+      handleAuthUser(result.user);
+    } catch (err) {
+      showAuthError(`Ошибка входа Google: ${err.message}`);
+    }
+  });
+
+  btnLogout.addEventListener("click", async () => {
+    await auth.signOut();
+    state.user = null;
+    appContainer.style.display = "none";
+    authOverlay.style.display = "flex";
+    showToast("Вы вышли из системы", "success");
+  });
+
+  auth.onAuthStateChanged((user) => {
+    if (user) {
+      handleAuthUser(user);
+    } else {
+      appContainer.style.display = "none";
+      authOverlay.style.display = "flex";
+    }
+  });
+}
+
+function handleAuthUser(user) {
+  const userEmail = (user.email || "").toLowerCase().trim();
+  const allowed = WHITELIST_EMAIL.toLowerCase().trim();
+
+  if (userEmail === allowed) {
+    // Whitelist Access GRANTED
+    state.user = user;
+    authOverlay.style.display = "none";
+    appContainer.style.display = "flex";
+
+    sidebarUserName.innerText = user.displayName || "Admin";
+    sidebarUserEmail.innerText = user.email;
+    if (user.photoURL) {
+      sidebarUserAvatar.src = user.photoURL;
+    }
+
+    showToast(`Добро пожаловать, ${user.displayName || user.email}!`, "success");
+    syncAccountsFromBackend();
+    startAutoregPoller();
+  } else {
+    // Access DENIED
+    auth.signOut();
+    showAuthError(`⛔ Доступ запрещен! Ваш email (${user.email}) не в белом списке. Доступ разрешен исключительно для ${WHITELIST_EMAIL}.`);
+  }
+}
+
+function showAuthError(msg) {
+  authErrorMsg.innerText = msg;
+  authErrorMsg.style.display = "block";
+}
+
+// --- View Switcher (Mail vs Autoreg) ---
+function switchView(viewName) {
+  state.currentView = viewName;
+  if (viewName === "mail") {
+    tabNavMail.className = "btn btn-primary";
+    tabNavAutoreg.className = "btn btn-secondary";
+    viewMailWrapper.style.display = "flex";
+    viewAutoregWrapper.style.display = "none";
+  } else {
+    tabNavMail.className = "btn btn-secondary";
+    tabNavAutoreg.className = "btn btn-primary";
+    viewMailWrapper.style.display = "none";
+    viewAutoregWrapper.style.display = "flex";
+    fetchAutoregLogs();
+  }
+}
+
+// --- Autoregistration Controller ---
+async function startAutoreg() {
+  const tasks = parseInt(inputAutoregTasks.value, 10) || 5;
+  const concurrent = parseInt(inputAutoregConcurrent.value, 10) || 1;
+  const suffix = inputAutoregSuffix.value || "@outlook.com";
+
+  btnStartAutoreg.disabled = true;
+  autoregActionStatus.innerText = "Запуск воркера...";
+
+  try {
+    const url = `${state.backendUrl.replace(/\/+$/, "")}/api/autoreg/start`;
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        tasks: tasks,
+        concurrent: concurrent,
+        email_suffix: suffix,
+        headless: true,
+      }),
+    });
+    const data = await resp.json();
+
+    if (data.success) {
+      showToast(`Авторегистрация запущена (Задач: ${tasks}, Потоков: ${concurrent})!`, "success");
+      btnStopAutoreg.disabled = false;
+      autoregActionStatus.innerText = `Воркер запущен (PID ${data.pid || "Active"})`;
+      fetchAutoregLogs();
+    } else {
+      throw new Error(data.error || "Не удалось запустить воркер");
+    }
+  } catch (err) {
+    showToast(`Ошибка запуска: ${err.message}`, "error");
+    btnStartAutoreg.disabled = false;
+    autoregActionStatus.innerText = `Ошибка: ${err.message}`;
+  }
+}
+
+async function stopAutoreg() {
+  autoregActionStatus.innerText = "Остановка воркера...";
+  try {
+    const url = `${state.backendUrl.replace(/\/+$/, "")}/api/autoreg/stop`;
+    const resp = await fetch(url, { method: "POST" });
+    const data = await resp.json();
+
+    if (data.success) {
+      showToast("Воркер авторегистрации остановлен", "success");
+      btnStartAutoreg.disabled = false;
+      btnStopAutoreg.disabled = true;
+      autoregActionStatus.innerText = "Воркер остановлен";
+    }
+  } catch (err) {
+    showToast(`Ошибка остановки: ${err.message}`, "error");
+  }
+}
+
+async function syncDbNow() {
+  btnSyncDbNow.disabled = true;
+  try {
+    const url = `${state.backendUrl.replace(/\/+$/, "")}/api/autoreg/sync`;
+    const resp = await fetch(url, { method: "POST" });
+    const data = await resp.json();
+    showToast(`Синхронизировано новых аккаунтов: ${data.imported_count || 0}`, "success");
+    syncAccountsFromBackend();
+  } catch (err) {
+    showToast(`Ошибка синхронизации: ${err.message}`, "error");
+  } finally {
+    btnSyncDbNow.disabled = false;
+  }
+}
+
+function startAutoregPoller() {
+  if (state.autoregTimer) clearInterval(state.autoregTimer);
+  state.autoregTimer = setInterval(() => {
+    fetchAutoregLogs();
+  }, 2000);
+}
+
+async function fetchAutoregLogs() {
+  if (!state.backendUrl) return;
+
+  try {
+    const url = `${state.backendUrl.replace(/\/+$/, "")}/api/autoreg/logs?limit=150`;
+    const resp = await fetch(url);
+    const data = await resp.json();
+
+    if (data.success) {
+      const status = data.status || {};
+      const isRunning = Boolean(status.running);
+
+      metricStatus.innerText = isRunning ? "🟢 Работает" : "⚪ Остановлен";
+      metricStatus.style.color = isRunning ? "var(--success)" : "var(--text-dim)";
+      metricRegistered.innerText = String(status.registered_count || 0);
+      metricPid.innerText = status.pid ? `#${status.pid}` : "—";
+      metricTasks.innerText = String(inputAutoregTasks.value);
+
+      btnStartAutoreg.disabled = isRunning;
+      btnStopAutoreg.disabled = !isRunning;
+
+      renderTerminalLines(data.lines || []);
+    }
+  } catch (err) {
+    // Silently continue polling
+  }
+}
+
+function renderTerminalLines(lines) {
+  if (!lines || lines.length === 0) return;
+
+  terminalBody.innerHTML = "";
+  lines.forEach((line) => {
+    const div = document.createElement("div");
+    let cls = "terminal-line";
+    if (line.includes("[ERROR]") || line.includes("Fail") || line.includes("ERR")) {
+      cls += " error";
+    } else if (line.includes("[WARN]")) {
+      cls += " warn";
+    } else if (line.includes("[INIT]") || line.includes("[DB]") || line.includes("Success")) {
+      cls += " info";
+    }
+    div.className = cls;
+    div.innerText = line;
+    terminalBody.appendChild(div);
+  });
+
+  if (checkAutoscroll.checked) {
+    terminalBody.scrollTop = terminalBody.scrollHeight;
   }
 }
 
@@ -73,7 +338,7 @@ function renderAccountsList() {
   if (state.accounts.length === 0) {
     accountsContainer.innerHTML = `
       <div style="padding: 16px 12px; font-size: 12px; color: var(--text-dim); text-align: center;">
-        Нет добавленных аккаунтов.<br>Нажмите «Добавить аккаунт» выше.
+        Нет аккаунтов.<br>Нажмите «+» или синхронизируйте с бекендом.
       </div>
     `;
     return;
@@ -86,12 +351,11 @@ function renderAccountsList() {
     card.innerHTML = `
       <div class="account-email" title="${acc.email}">${acc.email}</div>
       <div class="account-meta">
-        <span>${acc.source || "local"}</span>
-        <button class="btn btn-secondary btn-sm" style="padding: 1px 5px; font-size: 10px;" title="Удалить аккаунт">✕</button>
+        <span>${acc.source || "server"}</span>
+        <button class="btn btn-secondary btn-sm" style="padding: 1px 5px; font-size: 10px;" title="Удалить">✕</button>
       </div>
     `;
 
-    // Click to select
     card.addEventListener("click", (e) => {
       if (e.target.tagName.toLowerCase() === "button") {
         e.stopPropagation();
@@ -118,7 +382,7 @@ function deleteAccount(email) {
       viewContent.style.display = "none";
     }
   }
-  showToast("Аккаунт удален", "success");
+  showToast("Аккаунт удален из списка", "success");
 }
 
 function selectAccount(acc) {
@@ -127,7 +391,7 @@ function selectAccount(acc) {
   loadMessages();
 }
 
-// --- Messages Handling ---
+// --- Mail Messages Handling ---
 async function loadMessages() {
   if (!state.currentAccount) return;
 
@@ -143,7 +407,6 @@ async function loadMessages() {
 
   try {
     let data;
-    // If backendUrl is set, we can query backend or use serverless function
     if (state.backendUrl && state.currentAccount.fromBackend) {
       const url = new URL(`${state.backendUrl.replace(/\/+$/, "")}/api/mail/inbox`);
       url.searchParams.set("email", state.currentAccount.email);
@@ -152,7 +415,6 @@ async function loadMessages() {
       const resp = await fetch(url.toString());
       data = await resp.json();
     } else {
-      // Query local Vercel serverless /api/inbox
       const resp = await fetch("/api/inbox", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -221,7 +483,6 @@ function renderMessagesList() {
       ${quickOtpBadge}
     `;
 
-    // Quick OTP click
     const badgeEl = card.querySelector(".quick-otp-badge");
     if (badgeEl) {
       badgeEl.addEventListener("click", (e) => {
@@ -292,7 +553,6 @@ function renderMessageDetail(msg) {
   const initial = (msg.from_name || msg.from_email || "?").charAt(0).toUpperCase();
   viewAvatar.innerText = initial;
 
-  // Handle OTP
   if (msg.otp && msg.otp.code) {
     viewOtpBanner.style.display = "flex";
     otpDisplayValue.innerText = msg.otp.code;
@@ -308,7 +568,6 @@ function renderMessageDetail(msg) {
     viewOtpBanner.style.display = "none";
   }
 
-  // HTML content
   const htmlContent = msg.body_content || msg.body_preview || "";
   if (msg.body_type === "html" || htmlContent.includes("<")) {
     viewIframe.srcdoc = htmlContent;
@@ -321,7 +580,7 @@ function renderMessageDetail(msg) {
   updateLucide();
 }
 
-// --- Sync Accounts from Backend (Oracle / Render) ---
+// --- Sync Accounts from Backend ---
 async function syncAccountsFromBackend() {
   if (!state.backendUrl) return;
 
@@ -334,10 +593,9 @@ async function syncAccountsFromBackend() {
       const backendAccounts = data.accounts.map((a) => ({
         email: a.email,
         fromBackend: true,
-        source: "oracle/render",
+        source: "backend",
       }));
 
-      // Merge backend accounts with local accounts
       const existingEmails = new Set(state.accounts.map((a) => a.email));
       backendAccounts.forEach((ba) => {
         if (!existingEmails.has(ba.email)) {
@@ -346,19 +604,30 @@ async function syncAccountsFromBackend() {
       });
 
       saveLocalAccounts();
-      showToast(`Синхронизировано ${backendAccounts.length} аккаунтов с бекенда`, "success");
       if (!state.currentAccount && state.accounts.length > 0) {
         selectAccount(state.accounts[0]);
       }
     }
   } catch (err) {
-    showToast(`Не удалось подключиться к бекенду: ${err.message}`, "error");
+    console.error("Backend sync failed:", err);
   }
 }
 
-// --- Event Listeners ---
+// --- Setup Event Listeners ---
 function setupEventListeners() {
-  // Navigation folders
+  // Navigation tabs (Mail vs Autoreg)
+  tabNavMail.addEventListener("click", () => switchView("mail"));
+  tabNavAutoreg.addEventListener("click", () => switchView("autoreg"));
+
+  // Autoreg control buttons
+  btnStartAutoreg.addEventListener("click", startAutoreg);
+  btnStopAutoreg.addEventListener("click", stopAutoreg);
+  btnSyncDbNow.addEventListener("click", syncDbNow);
+  btnClearTerminal.addEventListener("click", () => {
+    terminalBody.innerHTML = `<div class="terminal-line info">[SYS] Terminal cleared.</div>`;
+  });
+
+  // Mail folder tabs
   document.querySelectorAll(".nav-folders .nav-item").forEach((item) => {
     item.addEventListener("click", () => {
       document.querySelectorAll(".nav-folders .nav-item").forEach((i) => i.classList.remove("active"));
@@ -377,25 +646,18 @@ function setupEventListeners() {
     }, 400);
   });
 
-  // Manual refresh button
   document.getElementById("btn-manual-refresh").addEventListener("click", () => {
     loadMessages();
-    showToast("Список писем обновлен", "success");
+    showToast("Письма обновлены", "success");
   });
 
-  // Auto-refresh change
   autoRefreshSelect.addEventListener("change", setupAutoRefresh);
 
-  // Sync accounts button
   document.getElementById("btn-sync-accounts").addEventListener("click", () => {
-    if (state.backendUrl) {
-      syncAccountsFromBackend();
-    } else {
-      openModal("modal-settings");
-    }
+    syncAccountsFromBackend();
+    showToast("Аккаунты синхронизированы", "success");
   });
 
-  // Modal open buttons
   document.getElementById("btn-open-connect").addEventListener("click", () => openModal("modal-connect"));
   document.getElementById("btn-open-settings").addEventListener("click", () => openModal("modal-settings"));
 
@@ -412,7 +674,7 @@ function setupEventListeners() {
     }
   });
 
-  // Save Account
+  // Save manual account
   document.getElementById("btn-save-account").addEventListener("click", () => {
     const email = document.getElementById("input-email").value.trim();
     const clientId = document.getElementById("input-client-id").value.trim() || "d3590ed6-52b3-4102-aeff-aad2292ab01c";
@@ -430,7 +692,6 @@ function setupEventListeners() {
       source: "manual",
     };
 
-    // Replace if exists, or append
     const idx = state.accounts.findIndex((a) => a.email === email);
     if (idx >= 0) {
       state.accounts[idx] = newAcc;
@@ -453,10 +714,11 @@ function setupEventListeners() {
     showToast("Настройки сохранены", "success");
     if (url) {
       syncAccountsFromBackend();
+      fetchAutoregLogs();
     }
   });
 
-  // Tab switching in message viewer
+  // Message viewer tabs (HTML vs Text)
   document.querySelectorAll(".view-tab").forEach((tab) => {
     tab.addEventListener("click", () => {
       document.querySelectorAll(".view-tab").forEach((t) => t.classList.remove("active"));
@@ -472,7 +734,7 @@ function setupEventListeners() {
     });
   });
 
-  // Copy message body
+  // Copy body
   document.getElementById("btn-copy-body").addEventListener("click", () => {
     if (state.currentMessage) {
       const text = state.currentMessage.body_content || state.currentMessage.body_preview || "";
@@ -498,7 +760,9 @@ function setupAutoRefresh() {
   const sec = parseInt(autoRefreshSelect.value, 10);
   if (sec > 0) {
     state.refreshTimer = setInterval(() => {
-      loadMessages();
+      if (state.currentView === "mail") {
+        loadMessages();
+      }
     }, sec * 1000);
   }
 }
