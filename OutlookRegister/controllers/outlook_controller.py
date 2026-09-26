@@ -831,25 +831,27 @@ class OutlookController:
         month = str(random.randint(1, 12))
         day = str(random.randint(1, 25))
 
-        try:
-            page.goto("https://outlook.live.com/mail/0/?prompt=create_account", timeout=30000, wait_until="domcontentloaded")
-            for selector in ['text=同意并继续', 'text=Accept', 'text=Accept all', 'text=Agree and continue', 'text=Принять', "button:has-text('同意')"]:
-                try:
-                    btn = page.locator(selector).first
-                    if btn.is_visible(timeout=2000):
-                        page.wait_for_timeout(0.1 * self.wait_time)
-                        btn.click(timeout=5000)
-                        break
-                except Exception:
-                    pass
-        except Exception as exc:
-            self.bump_failure('ip_cant_open', 'register_page_open_fail')
-            err_str = str(exc)
-            if '403' in err_str or 'TUNNEL' in err_str or 'tunnel' in err_str:
-                self._log(f"[Fail:IP] - Прокси отклонил доступ (403 Forbidden / Tunnel Failed). Домен outlook.live.com заблокирован вашим провайдером прокси: {err_str[:120]}")
-            else:
-                self._log(f"[Fail:IP] - Не удалось открыть Outlook ({err_str[:100]}). Проверьте прокси или смените IP.")
-            return False
+        for goto_attempt in range(2):
+            try:
+                page.goto("https://outlook.live.com/mail/0/?prompt=create_account", timeout=35000, wait_until="domcontentloaded")
+                for selector in ['text=同意并继续', 'text=Accept', 'text=Accept all', 'text=Agree and continue', 'text=Принять', "button:has-text('同意')"]:
+                    try:
+                        btn = page.locator(selector).first
+                        if btn.is_visible(timeout=2000):
+                            page.wait_for_timeout(0.1 * self.wait_time)
+                            btn.click(timeout=5000)
+                            break
+                    except Exception:
+                        pass
+                break
+            except Exception as exc:
+                if goto_attempt == 0:
+                    page.wait_for_timeout(2000)
+                    continue
+                self.bump_failure('ip_cant_open', 'register_page_open_fail')
+                err_str = str(exc)
+                self._log(f"[Fail:IP] - Ошибка при загрузке Outlook: {err_str[:120]}")
+                return False
 
         try:
             # 选择是 outlook还是hotmail
@@ -1297,8 +1299,9 @@ class OutlookController:
             return False
 
         # 微软验证码是嵌套iframe结构
-        frame1 = page.frame_locator('iframe[title="验证质询"]')
-        frame2 = frame1.frame_locator('iframe[style*="display: block"]')
+        f1_sel = 'iframe[title="验证质询"], iframe[title*="质询"], iframe[title*="challenge" i], iframe[title*="Challenge" i], iframe[src*="arkoselabs"], iframe[src*="arkose"], iframe#enforcementFrame'
+        frame1 = page.frame_locator(f1_sel)
+        frame2 = frame1.frame_locator('iframe[style*="display: block"], iframe[id*="game"], iframe')
         self._human_prelude(page)
         btn2_seen = False
 
@@ -1401,22 +1404,31 @@ class OutlookController:
     # ============================================================
     def _wait_for_captcha_frame(self, page):
         """轮询等待验证码iframe加载，最多15秒"""
+        f1_selectors = [
+            'iframe[title="验证质询"]',
+            'iframe[title*="质询"]',
+            'iframe[title*="challenge" i]',
+            'iframe[title*="Challenge" i]',
+            'iframe[src*="arkoselabs"]',
+            'iframe[src*="arkose"]',
+            'iframe#enforcementFrame'
+        ]
         for _ in range(15):
             try:
-                # 微软验证码嵌套iframe：外层title="验证质询"，内层style*="display:block"
-                f1 = page.frame_locator('iframe[title="验证质询"]')
-                if f1.locator('iframe').count() > 0:
-                    f2 = f1.frame_locator('iframe[style*="display: block"]')  # 内层可见iframe
-                    for sel in ['[aria-label="可访问性挑战"]', 'circle', 'svg', '[role="button"]']:
-                        try:
-                            cnt = f2.locator(sel).count()
-                            if cnt > 0:
-                                box = f2.locator(sel).first.bounding_box()
-                                if box and box['width'] > 5:
-                                    self._log(f"iframe就绪: {sel}")
-                                    page.wait_for_timeout(random.randint(500, 1500))
-                                    return True
-                        except Exception: continue
+                for sel_f1 in f1_selectors:
+                    f1 = page.frame_locator(sel_f1)
+                    if f1.locator('iframe').count() > 0:
+                        f2 = f1.frame_locator('iframe[style*="display: block"], iframe[id*="game"], iframe')
+                        for sel in ['[aria-label="可访问性挑战"]', '[aria-label*="挑战"]', '[aria-label*="challenge" i]', '[aria-label*="audio" i]', 'circle', 'svg', '[role="button"]']:
+                            try:
+                                cnt = f2.locator(sel).count()
+                                if cnt > 0:
+                                    box = f2.locator(sel).first.bounding_box()
+                                    if box and box['width'] > 5:
+                                        self._log(f"iframe就绪: {sel}")
+                                        page.wait_for_timeout(random.randint(500, 1500))
+                                        return True
+                            except Exception: continue
             except Exception: pass
             page.wait_for_timeout(1000)
         return False
@@ -1472,7 +1484,7 @@ class OutlookController:
     # ============================================================
     def _find_target(self, frame2, attempt):
         """在验证码iframe中遍历候选选择器，找到尺寸>8px的第一个可见目标"""
-        for sel in ['[aria-label="可访问性挑战"]', 'circle', 'ellipse',
+        for sel in ['[aria-label="可访问性挑战"]', '[aria-label*="挑战"]', '[aria-label*="challenge" i]', '[aria-label*="audio" i]', 'circle', 'ellipse',
                     'svg circle', 'svg ellipse', '[role="button"]', 'svg']:
             try:
                 candidates = frame2.locator(sel)
@@ -1508,7 +1520,7 @@ class OutlookController:
         """按住状态下圆形微颤，等待"再次按下"按钮出现。出现后延续按压1.5-4.5s"""
         self._circular_tremor(page, x, y, duration_ms=random.randint(600, 1800))
         appeared = False
-        btn2_selectors = ['[aria-label="再次按下"]', '[aria-label*="再次"]', '[aria-label*="按下"]']
+        btn2_selectors = ['[aria-label="再次按下"]', '[aria-label*="再次"]', '[aria-label*="按下"]', '[aria-label*="press" i]', '[aria-label*="hold" i]', '[aria-label*="again" i]', 'button:has-text("Press")', 'button:has-text("Hold")']
         for sel in btn2_selectors:
             try:
                 frame2.locator(sel).wait_for(state='visible', timeout=10000)
