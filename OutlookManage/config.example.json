@@ -1,0 +1,46 @@
+{
+  "proxy": {
+    "url": "http://127.0.0.1:7890"
+  },
+  "database": {
+    "path": "data/accounts.db"
+  },
+  "remote": {
+    "base_url": "",
+    "password": "",
+    "group_map": {
+      "outlook.com": 0,
+      "hotmail.com": 0
+    },
+    "skip_unmapped": true,
+    "default_group_id": 0,
+    "provider": "outlook",
+    "account_format": "client_id_refresh_token"
+  },
+  "server": {
+    "host": "127.0.0.1",
+    "port": 18080
+  },
+  "temp_mail": {
+    "base_url": "",
+    "domain": "",
+    "admin_password": "",
+    "site_password": ""
+  },
+  "recovery": {
+    "enabled": true,
+    "headless": false,
+    "wait_after_code_submit_sec": 8,
+    "captcha_max_attempts": 4,
+    "unrecoverable_max_attempts": 3,
+    "mail_poll_timeout_sec": 180,
+    "mail_poll_interval_sec": 5
+  },
+  "protocol_test": {
+    "external_recipient": ""
+  },
+  "ui": {
+    "title": "Outlook Manage WebUI",
+    "default_concurrency": 20
+  }
+}

@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+log/
+*.log
+browser_profiles/
+
+# Local secrets & runtime data (never commit)
+config.json
+config.local.json
+Results/
+!Results/.gitkeep
+
+# Local tooling
+_merge_from_monorepo.py
+plan.md

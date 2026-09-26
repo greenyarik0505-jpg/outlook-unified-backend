@@ -1,0 +1,224 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+      - "replace-v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, for example v1.0"
+        required: true
+        default: "v1.0"
+        type: string
+      replace_existing:
+        description: "Replace an existing release and tag after all builds pass"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  GO_VERSION: "1.24.4"
+  BUILD_TAGS: "with_clash_api with_utls with_quic"
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Run tests
+        run: go test ./...
+
+      - name: Run vet
+        run: go vet ./...
+
+      - name: Run race and runtime tests with release features
+        env:
+          EASY_PROXIES_RUNTIME_TEST: "1"
+        run: go test -race -tags "$BUILD_TAGS" ./...
+
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: windows
+            asset_os: windows
+            goarch: amd64
+            extension: .exe
+          - goos: windows
+            asset_os: windows
+            goarch: arm64
+            extension: .exe
+          - goos: linux
+            asset_os: linux
+            goarch: amd64
+            extension: ""
+          - goos: linux
+            asset_os: linux
+            goarch: arm64
+            extension: ""
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Build and package
+        shell: bash
+        env:
+          RAW_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+          TARGET_OS: ${{ matrix.goos }}
+          ASSET_OS: ${{ matrix.asset_os }}
+          TARGET_ARCH: ${{ matrix.goarch }}
+          EXTENSION: ${{ matrix.extension }}
+        run: |
+          set -euo pipefail
+          VERSION="${RAW_VERSION#replace-}"
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+(\.[0-9]+)?([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release version: $VERSION" >&2
+            exit 1
+          fi
+
+          asset_base="easy_proxies-${VERSION}-${ASSET_OS}-${TARGET_ARCH}"
+          asset_binary="${asset_base}${EXTENSION}"
+          package_binary="easy_proxies${EXTENSION}"
+
+          mkdir -p dist package
+          CGO_ENABLED=0 GOOS="$TARGET_OS" GOARCH="$TARGET_ARCH" \
+            go build -trimpath -tags "$BUILD_TAGS" -ldflags "-s -w" -o "dist/${asset_binary}" .
+
+          go version -m "dist/${asset_binary}" | grep -F -- "-tags=with_clash_api,with_utls,with_quic"
+          cp "dist/${asset_binary}" "package/${package_binary}"
+          cp config.example.yaml README.md README.zh-CN.md README.zh-TW.md CONTRIBUTING.md LICENSE package/
+          cp -r docs package/
+
+          if [[ "$TARGET_OS" != "windows" ]]; then
+            chmod +x "dist/${asset_binary}" "package/${package_binary}"
+          fi
+
+          (
+            cd package
+            zip -q -9 -r "../dist/${asset_base}.zip" .
+          )
+
+      - name: Upload build output
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: release-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Download build output
+        uses: actions/download-artifact@v8.0.1
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Validate assets and generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t assets < <(find release-assets -maxdepth 1 -type f -name 'easy_proxies-*' | sort)
+          if [[ ${#assets[@]} -ne 8 ]]; then
+            printf 'Expected 8 release assets, found %d\n' "${#assets[@]}" >&2
+            printf '%s\n' "${assets[@]}" >&2
+            exit 1
+          fi
+          (cd release-assets && sha256sum easy_proxies-* > SHA256SUMS.txt)
+
+      - name: Create GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RAW_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+          REPLACE_EXISTING: ${{ (github.event_name == 'workflow_dispatch' && inputs.replace_existing) || startsWith(github.ref_name, 'replace-v') }}
+        run: |
+          set -euo pipefail
+          VERSION="${RAW_VERSION#replace-}"
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+(\.[0-9]+)?([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release version: $VERSION" >&2
+            exit 1
+          fi
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            if [[ "$REPLACE_EXISTING" != "true" ]]; then
+              echo "Release $VERSION already exists; enable replacement explicitly" >&2
+              exit 1
+            fi
+            gh release delete "$VERSION" --cleanup-tag --yes
+          fi
+          if [[ "$REPLACE_EXISTING" == "true" ]] && git ls-remote --exit-code --tags origin "refs/tags/${VERSION}" >/dev/null 2>&1; then
+            gh api --method DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${VERSION}"
+          fi
+
+          notes_file="release-notes/${VERSION}.md"
+          if [[ ! -f "$notes_file" ]]; then
+            echo "Missing release notes: $notes_file" >&2
+            exit 1
+          fi
+          if grep -qP '[\x{3400}-\x{9FFF}]' "$notes_file"; then
+            echo "Release notes must be English-only: $notes_file" >&2
+            exit 1
+          fi
+          if ! grep -q '[A-Za-z]' "$notes_file"; then
+            echo "Release notes must include English content: $notes_file" >&2
+            exit 1
+          fi
+          if grep -qE '^#[[:space:]]+Easy Proxies v' "$notes_file"; then
+            echo "Release notes must not repeat the release title: $notes_file" >&2
+            exit 1
+          fi
+          title="Easy Proxies ${VERSION}"
+          notes_args=(--notes-file "$notes_file")
+
+          if [[ "$REPLACE_EXISTING" == "true" ]]; then
+            tag_args=(--target "$GITHUB_SHA")
+          elif git rev-parse --verify "refs/tags/${VERSION}" >/dev/null 2>&1; then
+            tag_args=(--verify-tag)
+          else
+            tag_args=(--target "$GITHUB_SHA")
+          fi
+
+          gh release create "$VERSION" release-assets/* \
+            --title "$title" \
+            "${notes_args[@]}" \
+            "${tag_args[@]}" \
+            --latest

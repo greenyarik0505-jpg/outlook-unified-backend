@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.env
+venv/
+env/
+.venv/
+
+# Application Runtime Data
+OutlookManage/data/
+OutlookManage/logs/
+OutlookRegister/Results/
+OutlookRegister/browser_profiles/
+browser_profiles/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# Sensitive Configs (Keep examples in repo)
+# config.json
+
+# Node / Vercel
+node_modules/
+.vercel/
+dist/
+.DS_Store

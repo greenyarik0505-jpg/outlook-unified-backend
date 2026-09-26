@@ -1,0 +1,75 @@
+# Binaries
+/easy-proxies
+/easy-proxies-*
+/easy_proxies
+/easy_proxies-*
+*.exe
+
+# Configuration (contains sensitive data)
+config.yaml
+nodes.txt
+proxyscrape_premium_http_proxies_*.txt
+/ProxySpace/*.txt
+/ProxySpace/proxy_audit_report*.json
+managed_nodes.json
+managed_nodes.db
+managed_nodes.db-wal
+managed_nodes.db-shm
+node_ports.json
+
+# GeoIP database (auto-downloaded)
+*.mmdb
+GeoLite2-Country.mmdb
+
+# Logs
+*.log
+logs/
+
+# IDE and editor
+.idea/
+.vscode/
+.serena/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Go
+vendor/
+
+# Test artifacts
+coverage.out
+coverage.html
+*.test
+__pycache__/
+*.py[cod]
+
+# Temporary and local backup files
+*.lock
+*.tmp
+*.bak
+*.bundle
+/images/.preview-browser*/
+
+# Qodo
+.qodo/
+
+# AI tool artifacts
+.ace-tool/
+.ccg/
+.claude/
+.codex/
+AGENTS.md
+
+# Local implementation plans and release workspace
+plan.md
+.public-release/
+/dist/
+
+# Personal automation
+start_easy_outlook.bat
+start_easy_outlook.ps1

@@ -1,0 +1,36 @@
+{
+  "email_suffix": "@outlook.com",
+  "headless": false,
+  "bot_protection_wait": 15,
+  "max_captcha_retries": 3,
+  "captcha_strategy": 0,
+  "concurrent_flows": 1,
+  "tasks": 1,
+  "success_tasks": null,
+  "batch_success_limit": 300,
+  "proxy": {
+    "mode": "single",
+    "type": "http",
+    "host": "",
+    "single_port": 0,
+    "port_start": 0,
+    "port_end": 0,
+    "max_per_proxy": 20
+  },
+  "oauth2": {
+    "enable_oauth2": true,
+    "client_id": "9e5f94bc-e8a4-4e73-b8be-63364c29d753",
+    "redirect_url": "http://localhost",
+    "Scopes": ["offline_access", "https://graph.microsoft.com/.default"]
+  },
+  "temp_mail": {
+    "enabled": false,
+    "base_url": "",
+    "admin_password": "",
+    "domain": "",
+    "name_prefix": "",
+    "enable_prefix": false,
+    "code_timeout": 120,
+    "poll_interval": 3
+  }
+}

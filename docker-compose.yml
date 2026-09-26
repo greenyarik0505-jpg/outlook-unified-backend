@@ -1,0 +1,24 @@
+services:
+  outlook-unified:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: outlook-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PORT=8000
+    volumes:
+      - ./OutlookManage/data:/app/OutlookManage/data
+      - ./OutlookManage/logs:/app/OutlookManage/logs
+      - ./OutlookRegister/Results:/app/OutlookRegister/Results
+      - ./OutlookManage/config.json:/app/OutlookManage/config.json
+      - ./OutlookRegister/config.json:/app/OutlookRegister/config.json
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/api/status || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s

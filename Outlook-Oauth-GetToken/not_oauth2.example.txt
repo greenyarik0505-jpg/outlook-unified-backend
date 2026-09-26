@@ -1,0 +1,4 @@
+# 每行一个账号：邮箱----密码
+# 以 # 开头的行为注释
+user1@outlook.com----YourPassword1
+user2@hotmail.com----YourPassword2

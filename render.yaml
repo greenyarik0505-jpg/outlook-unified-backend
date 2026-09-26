@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: outlook-backend
+    env: docker
+    plan: free
+    region: frankfurt
+    dockerfilePath: Dockerfile
+    healthCheckPath: /api/status
+    envVars:
+      - key: PORT
+        value: 8000
+      - key: PYTHONUNBUFFERED
+        value: "1"

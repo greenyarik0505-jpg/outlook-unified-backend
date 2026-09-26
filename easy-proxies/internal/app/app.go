@@ -1,0 +1,232 @@
+package app
+
+import (
+	"context"
+	"fmt"
+	"os/signal"
+	"path/filepath"
+	"syscall"
+	"time"
+
+	"easy_proxies/internal/backup"
+	"easy_proxies/internal/boxmgr"
+	"easy_proxies/internal/builder"
+	"easy_proxies/internal/config"
+	"easy_proxies/internal/importer"
+	"easy_proxies/internal/monitor"
+	"easy_proxies/internal/subscription"
+)
+
+// Run builds the runtime components from config and blocks until shutdown.
+func Run(ctx context.Context, cfg *config.Config) error {
+	ctx, stopSignals := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
+	defer stopSignals()
+	startupStarted := time.Now()
+	// Build monitor config
+	proxyUsername := cfg.Listener.Username
+	proxyPassword := cfg.Listener.Password
+	if cfg.Mode == "multi-port" || cfg.Mode == "hybrid" {
+		proxyUsername = cfg.MultiPort.Username
+		proxyPassword = cfg.MultiPort.Password
+	}
+
+	monitorCfg := monitor.Config{
+		Enabled:       cfg.ManagementEnabled(),
+		Listen:        cfg.Management.Listen,
+		ProbeTarget:   cfg.Management.ProbeTarget,
+		Password:      cfg.Management.Password,
+		ProxyUsername: proxyUsername,
+		ProxyPassword: proxyPassword,
+		ExternalIP:    cfg.ExternalIP,
+		PprofEnabled:  cfg.Management.PprofEnabled,
+	}
+
+	// Create and start BoxManager
+	boxMgr := boxmgr.New(cfg, monitorCfg)
+	defer boxMgr.Close()
+	monitorStarted := time.Now()
+	if err := boxMgr.EnsureMonitor(ctx); err != nil {
+		return fmt.Errorf("init monitor server: %w", err)
+	}
+	monitorDuration := time.Since(monitorStarted)
+
+	// Wire up config to monitor server for settings API
+	if server := boxMgr.MonitorServer(); server != nil {
+		server.SetConfig(cfg)
+	}
+
+	// Always create SubscriptionManager so WebUI can hot-reload subscription config
+	subMgr := subscription.New(cfg, boxMgr)
+	defer subMgr.Stop()
+
+	// Wire up subscription manager to monitor server for API endpoints
+	if server := boxMgr.MonitorServer(); server != nil {
+		server.SetSubscriptionRefresher(subMgr)
+	}
+
+	// Initialize import service
+	storeStarted := time.Now()
+	storePath := filepath.Join(filepath.Dir(cfg.FilePath()), "managed_nodes.json")
+	nodeStore, err := importer.NewStore(storePath)
+	if err != nil {
+		return fmt.Errorf("create node store: %w", err)
+	}
+	storeDuration := time.Since(storeStarted)
+	defer nodeStore.Close()
+
+	// Pool is the single source of truth for sing-box listeners.
+	// Filter cfg.Nodes to pool DB members before sing-box starts so the
+	// runtime listener count == WebUI pool count == config.yaml managed pool.
+	// On fresh installs (empty pool) we leave cfg.Nodes untouched so the
+	// initial subscription-loaded nodes remain usable until first promote.
+	if poolNodes := nodeStore.ListPoolNodes(); len(poolNodes) > 0 {
+		poolByRoute := make(map[string]importer.ManagedNode, len(poolNodes))
+		for _, pn := range poolNodes {
+			if pn.URI != "" {
+				poolByRoute[pn.URI+"\x00"+pn.ChainProfileID] = pn
+			}
+		}
+		filtered := make([]config.NodeConfig, 0, len(poolByRoute))
+		seen := make(map[string]struct{}, len(poolByRoute))
+		for _, n := range cfg.Nodes {
+			key := n.URI + "\x00" + n.ChainProfileID
+			if pn, ok := poolByRoute[key]; ok {
+				if pn.Name != "" {
+					n.Name = pn.Name
+				}
+				filtered = append(filtered, n)
+				seen[key] = struct{}{}
+			}
+		}
+		// Include pool entries that have no matching subscription URI yet
+		// (e.g. user manually imported them). These arrive with Port=0
+		// and will be assigned by RebuildPortAssignments below.
+		for route, pn := range poolByRoute {
+			if _, ok := seen[route]; ok {
+				continue
+			}
+			filtered = append(filtered, pn.ToConfigNode())
+		}
+		cfg.Nodes = filtered
+		// Reset ports to 0 so the rebuild assigns them contiguously from
+		// base_port, independent of any stale port values carried over from
+		// the prior session's config load.
+		for i := range cfg.Nodes {
+			cfg.Nodes[i].Port = 0
+		}
+		if err := boxMgr.RebuildPortAssignments(); err != nil {
+			return fmt.Errorf("rebuild port assignments: %w", err)
+		}
+		if err := syncPoolRuntimePorts(nodeStore, poolNodes, cfg.Nodes); err != nil {
+			return fmt.Errorf("sync rebuilt port assignments: %w", err)
+		}
+	}
+
+	testerOptions := []importer.TesterOption{
+		importer.WithProbeTarget(cfg.Management.ProbeTarget),
+		importer.WithTesterTimeout(cfg.SubscriptionRefresh.HealthCheckTimeout),
+		importer.WithSkipCertVerify(cfg.SkipCertVerify),
+		importer.WithChainProfiles(cfg.ChainProfiles),
+		importer.WithChainOutboundBuilder(builder.BuildChainOutbounds),
+	}
+	if cfg.Mode == "multi-port" || cfg.Mode == "hybrid" {
+		testerOptions = append(testerOptions, importer.WithRuntimeProxy(
+			cfg.MultiPort.Address,
+			cfg.MultiPort.Username,
+			cfg.MultiPort.Password,
+		))
+	}
+	tester := importer.NewNodeTester(builder.BuildSingleNodeOutbound, testerOptions...)
+	defer tester.Close()
+
+	importSvc := importer.NewService(nodeStore, tester, boxMgr,
+		importer.WithRefreshSourceTimeout(cfg.SubscriptionRefresh.Timeout),
+	)
+	subMgr.SetSourceRefresher(importSvc)
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_ = importSvc.Close(closeCtx)
+	}()
+	if server := boxMgr.MonitorServer(); server != nil {
+		server.SetImportService(importSvc)
+		server.SetBackupService(backup.NewService(cfg, nodeStore, boxMgr, subMgr, importSvc))
+	}
+
+	coreStarted := false
+	runtimeStarted := time.Now()
+	if len(cfg.Nodes) == 0 {
+		fmt.Println("No pool nodes configured; WebUI is available for importing nodes.")
+	} else {
+		if err := boxMgr.Start(ctx); err != nil {
+			return fmt.Errorf("start box manager: %w", err)
+		}
+		coreStarted = true
+	}
+	boxMgr.SetStartupTimings(map[string]int64{
+		"monitor":     monitorDuration.Milliseconds(),
+		"state_store": storeDuration.Milliseconds(),
+		"runtime":     time.Since(runtimeStarted).Milliseconds(),
+		"total":       time.Since(startupStarted).Milliseconds(),
+	})
+
+	// Start refresh loop only after the initial sing-box instance is ready.
+	if coreStarted && cfg.SubscriptionRefresh.Enabled && len(cfg.Subscriptions) > 0 {
+		subMgr.Start()
+	}
+
+	// Wait for shutdown signal
+	<-ctx.Done()
+	fmt.Println("Shutdown requested, initiating graceful shutdown...")
+
+	// Create shutdown context with timeout
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer shutdownCancel()
+
+	// Graceful shutdown sequence
+	fmt.Println("Stopping subscription manager...")
+	if subMgr != nil {
+		subMgr.Stop()
+	}
+
+	fmt.Println("Stopping import jobs...")
+	if err := importSvc.Close(shutdownCtx); err != nil {
+		fmt.Printf("Error stopping import jobs: %v\n", err)
+	}
+
+	fmt.Println("Stopping box manager...")
+	if err := boxMgr.CloseContext(shutdownCtx); err != nil {
+		fmt.Printf("Error closing box manager: %v\n", err)
+	}
+
+	fmt.Println("Graceful shutdown completed")
+
+	return nil
+}
+
+func syncPoolRuntimePorts(store *importer.Store, poolNodes []importer.ManagedNode, configNodes []config.NodeConfig) error {
+	if store == nil || len(poolNodes) == 0 {
+		return nil
+	}
+	byRoute := make(map[string]config.NodeConfig, len(configNodes))
+	for _, node := range configNodes {
+		byRoute[node.URI+"\x00"+node.ChainProfileID] = node
+	}
+	updates := make([]importer.ManagedNode, 0)
+	for _, node := range poolNodes {
+		configured, ok := byRoute[node.URI+"\x00"+node.ChainProfileID]
+		if !ok || configured.Port == 0 {
+			return fmt.Errorf("runtime port missing for pool node")
+		}
+		if node.Port == configured.Port && node.Name == configured.Name {
+			continue
+		}
+		node.Port = configured.Port
+		node.Name = configured.Name
+		updates = append(updates, node)
+	}
+	if len(updates) == 0 {
+		return nil
+	}
+	return store.UpsertNodes(updates)
+}

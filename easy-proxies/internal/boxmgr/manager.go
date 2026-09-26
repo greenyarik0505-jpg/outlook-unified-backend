@@ -1,0 +1,2117 @@
+package boxmgr
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"net"
+	"regexp"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"easy_proxies/internal/builder"
+	"easy_proxies/internal/config"
+	"easy_proxies/internal/geoip"
+	"easy_proxies/internal/monitor"
+	"easy_proxies/internal/outbound/dispatch"
+	"easy_proxies/internal/outbound/pool"
+	"easy_proxies/internal/proxychain"
+
+	"github.com/sagernet/sing-box"
+	C "github.com/sagernet/sing-box/constant"
+	"github.com/sagernet/sing-box/include"
+	singlog "github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing-box/option"
+)
+
+// Ensure Manager implements monitor.NodeManager.
+var _ monitor.NodeManager = (*Manager)(nil)
+
+const (
+	defaultDrainTimeout       = 10 * time.Second
+	defaultHealthCheckTimeout = 5 * time.Second
+	healthCheckPollInterval   = 500 * time.Millisecond
+	periodicHealthInterval    = 5 * time.Minute
+	periodicHealthTimeout     = 5 * time.Second
+	runtimePortReadyTimeout   = 5 * time.Second
+)
+
+// Logger defines logging interface for the manager.
+type Logger interface {
+	Infof(format string, args ...any)
+	Warnf(format string, args ...any)
+	Errorf(format string, args ...any)
+}
+
+type runtimePortValidationError struct {
+	Failures []builder.NodeValidationFailure
+}
+
+func (e *runtimePortValidationError) Error() string {
+	if len(e.Failures) == 0 {
+		return "运行节点构建失败"
+	}
+	samples := make([]string, 0, min(8, len(e.Failures)))
+	for _, failure := range e.Failures[:min(8, len(e.Failures))] {
+		name := strings.TrimSpace(failure.Name)
+		if name == "" {
+			name = "未命名节点"
+		}
+		if failure.Port > 0 {
+			samples = append(samples, fmt.Sprintf("%s(%d): %s", name, failure.Port, failure.Reason))
+		} else {
+			samples = append(samples, fmt.Sprintf("%s: %s", name, failure.Reason))
+		}
+	}
+	return fmt.Sprintf("%d 个节点无法构建运行配置（示例: %s）", len(e.Failures), strings.Join(samples, "; "))
+}
+
+func (m *Manager) Diagnostics() map[string]any {
+	m.mu.RLock()
+	cfg := cloneConfig(m.cfg)
+	instance := m.currentBox
+	m.mu.RUnlock()
+	result := map[string]any{"running": instance != nil}
+	if cfg == nil {
+		return result
+	}
+	result["mode"] = cfg.Mode
+	result["configured_nodes"] = len(cfg.Nodes)
+	if instance != nil {
+		result["inbounds"] = len(instance.Inbound().Inbounds())
+		result["outbounds"] = len(instance.Outbound().Outbounds())
+	}
+	if cfg.Mode == "multi-port" || cfg.Mode == "hybrid" {
+		result["listeners"] = len(cfg.Nodes)
+	}
+	if value := m.startupTimings.Load(); value != nil {
+		stored := value.(map[string]int64)
+		timings := make(map[string]int64, len(stored))
+		for stage, milliseconds := range stored {
+			timings[stage] = milliseconds
+		}
+		result["startup_ms"] = timings
+	}
+	return result
+}
+
+func (m *Manager) VerifyRuntime(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	m.mu.RLock()
+	cfg := cloneConfig(m.cfg)
+	m.mu.RUnlock()
+	if cfg == nil {
+		return errConfigUnavailable
+	}
+	if cfg.Mode != "multi-port" && cfg.Mode != "hybrid" || len(cfg.Nodes) == 0 {
+		return nil
+	}
+	host := strings.TrimSpace(cfg.MultiPort.Address)
+	if host == "" || host == "0.0.0.0" {
+		host = "127.0.0.1"
+	} else if host == "::" || host == "[::]" {
+		host = "::1"
+	}
+	pending := make([]uint16, 0, len(cfg.Nodes))
+	for _, node := range cfg.Nodes {
+		pending = append(pending, node.Port)
+	}
+	readyCtx, cancel := context.WithTimeout(ctx, runtimePortReadyTimeout)
+	defer cancel()
+	for {
+		pending = unavailableRuntimePorts(readyCtx, host, pending)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if len(pending) == 0 {
+			return nil
+		}
+		if err := readyCtx.Err(); err != nil {
+			break
+		}
+		timer := time.NewTimer(250 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-readyCtx.Done():
+			timer.Stop()
+			break
+		case <-timer.C:
+		}
+		if readyCtx.Err() != nil {
+			break
+		}
+	}
+	samples := make([]string, 0, min(8, len(pending)))
+	for _, port := range pending[:min(8, len(pending))] {
+		if port == 0 {
+			samples = append(samples, "未分配")
+		} else {
+			samples = append(samples, strconv.Itoa(int(port)))
+		}
+	}
+	return fmt.Errorf("%d 个运行端口不可用（示例: %s）", len(pending), strings.Join(samples, ", "))
+}
+
+func (m *Manager) ValidateNode(ctx context.Context, node config.NodeConfig) error {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	m.mu.RLock()
+	cfg := cloneConfig(m.cfg)
+	m.mu.RUnlock()
+	return builder.ValidateNodeConfig(cfg, node)
+}
+
+func unavailableRuntimePorts(ctx context.Context, host string, ports []uint16) []uint16 {
+	if len(ports) == 0 {
+		return nil
+	}
+	jobs := make(chan uint16)
+	failures := make(chan uint16, len(ports))
+	var workers sync.WaitGroup
+	for range min(32, len(ports)) {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			dialer := net.Dialer{Timeout: time.Second}
+			for port := range jobs {
+				if port == 0 {
+					failures <- port
+					continue
+				}
+				conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(host, strconv.Itoa(int(port))))
+				if err != nil {
+					failures <- port
+					continue
+				}
+				_ = conn.Close()
+			}
+		}()
+	}
+	go func() {
+		defer close(jobs)
+		for _, port := range ports {
+			select {
+			case <-ctx.Done():
+				return
+			case jobs <- port:
+			}
+		}
+	}()
+	workers.Wait()
+	close(failures)
+	result := make([]uint16, 0, len(failures))
+	for port := range failures {
+		result = append(result, port)
+	}
+	return result
+}
+
+func (m *Manager) SetStartupTimings(timings map[string]int64) {
+	cloned := make(map[string]int64, len(timings))
+	for stage, milliseconds := range timings {
+		cloned[stage] = milliseconds
+	}
+	m.startupTimings.Store(cloned)
+}
+
+// Option configures the Manager.
+type Option func(*Manager)
+
+// WithLogger sets a custom logger.
+func WithLogger(l Logger) Option {
+	return func(m *Manager) { m.logger = l }
+}
+
+// Manager owns the lifecycle of the active sing-box instance.
+type Manager struct {
+	mu        sync.RWMutex
+	reloadMu  sync.Mutex
+	closing   bool
+	closeDone chan struct{}
+	closeErr  error
+
+	currentBox    *box.Box
+	monitorMgr    *monitor.Manager
+	monitorServer *monitor.Server
+	geoRouter     *geoip.Router
+	cfg           *config.Config
+	monitorCfg    monitor.Config
+
+	drainTimeout      time.Duration
+	minAvailableNodes int
+	logger            Logger
+
+	baseCtx   context.Context
+	cancel    context.CancelFunc
+	portIndex atomic.Value
+
+	runtimeCfg        *config.Config
+	runtimeContexts   sync.Map
+	runtimeLogFactory singlog.Factory
+	startupTimings    atomic.Value
+}
+
+// New creates a BoxManager with the given config.
+func New(cfg *config.Config, monitorCfg monitor.Config, opts ...Option) *Manager {
+	m := &Manager{
+		cfg:               cfg,
+		monitorCfg:        monitorCfg,
+		runtimeLogFactory: singlog.NewNOPFactory(),
+	}
+	m.applyConfigSettings(cfg)
+	for _, opt := range opts {
+		opt(m)
+	}
+	if m.logger == nil {
+		m.logger = defaultLogger{}
+	}
+	if m.drainTimeout <= 0 {
+		m.drainTimeout = defaultDrainTimeout
+	}
+	return m
+}
+
+// Start creates and starts the initial sing-box instance.
+func (m *Manager) Start(ctx context.Context) error {
+	m.reloadMu.Lock()
+	defer m.reloadMu.Unlock()
+	return m.startLocked(ctx)
+}
+
+func (m *Manager) startLocked(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := m.ensureMonitor(ctx); err != nil {
+		return err
+	}
+
+	m.mu.Lock()
+	if m.closing {
+		m.mu.Unlock()
+		return errors.New("box manager is closed")
+	}
+	if m.cfg == nil {
+		m.mu.Unlock()
+		return errors.New("box manager requires config")
+	}
+	if m.currentBox != nil {
+		m.mu.Unlock()
+		return errors.New("sing-box already running")
+	}
+	m.applyConfigSettings(m.cfg)
+	if m.baseCtx != nil {
+		ctx = m.baseCtx
+	}
+	cfg := m.cfg
+	m.mu.Unlock()
+	if len(cfg.Nodes) == 0 {
+		return m.enterEmptyRuntime(cfg)
+	}
+
+	// Try to start, with automatic port conflict resolution
+	var instance *box.Box
+	portsChanged := false
+	started := false
+	maxRetries := len(cfg.Nodes) + 1
+	for retry := 0; retry < maxRetries; retry++ {
+		var err error
+		instance, err = m.createBox(ctx, cfg)
+		if err != nil {
+			return err
+		}
+		if err = instance.Start(); err != nil {
+			m.closeRuntimeInstance(instance)
+			// Check if it's a port conflict error
+			if conflictPort := extractPortFromBindError(err); conflictPort > 0 {
+				m.logger.Warnf("port %d is in use, reassigning and retrying...", conflictPort)
+				if reassigned := reassignConflictingPort(cfg, conflictPort); reassigned {
+					portsChanged = true
+					pool.ResetSharedStateStore() // Reset shared state for rebuild
+					continue
+				}
+			}
+			return fmt.Errorf("start sing-box: %w", err)
+		}
+		started = true
+		break
+	}
+	if !started {
+		return fmt.Errorf("start sing-box: exhausted port conflict retries")
+	}
+	if portsChanged && cfg.FilePath() != "" {
+		if err := cfg.Save(); err != nil {
+			m.closeRuntimeInstance(instance)
+			return fmt.Errorf("save reassigned ports: %w", err)
+		}
+	}
+	m.storePortIndex(cfg)
+
+	m.mu.Lock()
+	if m.closing {
+		m.mu.Unlock()
+		m.closeRuntimeInstance(instance)
+		return errors.New("box manager is closed")
+	}
+	m.currentBox = instance
+	m.runtimeCfg = cloneConfig(cfg)
+	m.mu.Unlock()
+
+	m.configureHealthChecks(cfg, false)
+
+	m.logger.Infof("sing-box instance started with %d nodes", len(cfg.Nodes))
+
+	// Start GeoIP router if enabled
+	if cfg.GeoIP.Enabled {
+		m.startGeoIPRouter(ctx, cfg)
+	}
+
+	return nil
+}
+
+// Reload gracefully switches to a new configuration.
+// For multi-port mode, we must stop the old instance first to release ports.
+func (m *Manager) Reload(newCfg *config.Config) error {
+	m.reloadMu.Lock()
+	defer m.reloadMu.Unlock()
+	return m.reloadLocked(newCfg)
+}
+
+func (m *Manager) reloadLocked(newCfg *config.Config) error {
+	if newCfg == nil {
+		return errors.New("new config is nil")
+	}
+
+	m.mu.Lock()
+	if m.closing {
+		m.mu.Unlock()
+		return errors.New("box manager is closed")
+	}
+	if m.currentBox == nil {
+		m.mu.Unlock()
+		return errors.New("manager not started")
+	}
+	ctx := m.baseCtx
+	oldBox := m.currentBox
+	oldCfg := cloneConfig(m.runtimeCfg)
+	if oldCfg == nil {
+		oldCfg = cloneConfig(m.cfg)
+	}
+	m.currentBox = nil // Mark as reloading
+	m.mu.Unlock()
+
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	m.logger.Infof("reloading with %d nodes", len(newCfg.Nodes))
+
+	// For multi-port mode, we must close old instance first to release ports
+	// This causes a brief interruption but avoids port conflicts
+	if oldBox != nil {
+		m.logger.Infof("stopping old instance to release ports...")
+		if err := oldBox.Close(); err != nil {
+			m.logger.Warnf("error closing old instance: %v", err)
+		}
+		m.runtimeContexts.Delete(oldBox)
+	}
+
+	// Stop GeoIP router before starting new box to release its port.
+	m.mu.Lock()
+	oldRouter := m.geoRouter
+	m.geoRouter = nil
+	m.mu.Unlock()
+	if oldRouter != nil {
+		_ = oldRouter.Stop()
+	}
+
+	if err := m.rebuildMultiPortAssignments(newCfg); err != nil {
+		m.rollbackToOldConfig(ctx, oldCfg)
+		return fmt.Errorf("rebuild multi-port assignments: %w", err)
+	}
+	if newCfg.FilePath() != "" {
+		if err := newCfg.Save(); err != nil {
+			m.rollbackToOldConfig(ctx, oldCfg)
+			return fmt.Errorf("save rebuilt config: %w", err)
+		}
+	}
+
+	// Give OS time to release ports
+	time.Sleep(500 * time.Millisecond)
+
+	// Reset shared state store to ensure clean state for new config
+	pool.ResetSharedStateStore()
+
+	// Clear stale monitor nodes so the dashboard reflects the new config
+	if m.monitorMgr != nil {
+		m.monitorMgr.ClearNodes()
+	}
+
+	// Create and start new box instance with automatic port conflict resolution
+	var instance *box.Box
+	portsChanged := false
+	started := false
+	maxRetries := len(newCfg.Nodes) + 1
+	for retry := 0; retry < maxRetries; retry++ {
+		var err error
+		instance, err = m.createBox(ctx, newCfg)
+		if err != nil {
+			m.rollbackToOldConfig(ctx, oldCfg)
+			return fmt.Errorf("create new box: %w", err)
+		}
+		if err = instance.Start(); err != nil {
+			m.closeRuntimeInstance(instance)
+			// Check if it's a port conflict error
+			if conflictPort := extractPortFromBindError(err); conflictPort > 0 {
+				m.logger.Warnf("port %d is in use, reassigning and retrying...", conflictPort)
+				if reassigned := reassignConflictingPort(newCfg, conflictPort); reassigned {
+					portsChanged = true
+					pool.ResetSharedStateStore()
+					continue
+				}
+			}
+			m.rollbackToOldConfig(ctx, oldCfg)
+			return fmt.Errorf("start new box: %w", err)
+		}
+		started = true
+		break
+	}
+	if !started {
+		m.rollbackToOldConfig(ctx, oldCfg)
+		return fmt.Errorf("start new box: exhausted port conflict retries")
+	}
+	if portsChanged && newCfg.FilePath() != "" {
+		if err := newCfg.Save(); err != nil {
+			m.closeRuntimeInstance(instance)
+			m.rollbackToOldConfig(ctx, oldCfg)
+			return fmt.Errorf("save reassigned ports: %w", err)
+		}
+	}
+
+	m.applyConfigSettings(newCfg)
+
+	m.mu.Lock()
+	if m.closing {
+		m.mu.Unlock()
+		m.closeRuntimeInstance(instance)
+		return errors.New("box manager is closed")
+	}
+	m.currentBox = instance
+	m.cfg = newCfg
+	m.runtimeCfg = cloneConfig(newCfg)
+	m.mu.Unlock()
+
+	// Sync config to monitor server so future WebUI settings changes target the current config pointer
+	if m.monitorServer != nil {
+		m.monitorServer.SetConfig(m.cfg)
+	}
+
+	m.configureHealthChecks(newCfg, true)
+
+	m.logger.Infof("reload completed successfully with %d nodes", len(newCfg.Nodes))
+
+	// Restart GeoIP router with new pools
+	if newCfg.GeoIP.Enabled {
+		m.startGeoIPRouter(ctx, newCfg)
+	} else {
+		m.mu.Lock()
+		oldRouter := m.geoRouter
+		m.geoRouter = nil
+		m.mu.Unlock()
+		if oldRouter != nil {
+			_ = oldRouter.Stop()
+		}
+	}
+
+	return nil
+}
+
+func (m *Manager) configureHealthChecks(cfg *config.Config, reloaded bool) {
+	m.mu.RLock()
+	monitorMgr := m.monitorMgr
+	ctx := m.baseCtx
+	m.mu.RUnlock()
+	if monitorMgr == nil || cfg == nil {
+		return
+	}
+	if cfg.Mode == "multi-port" {
+		monitorMgr.StopPeriodicHealthCheck()
+		monitorMgr.MarkAllAvailable()
+		return
+	}
+	started := monitorMgr.StartPeriodicHealthCheck(periodicHealthInterval, periodicHealthTimeout)
+	if !reloaded || started {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	go func() {
+		select {
+		case <-ctx.Done():
+		case <-time.After(3 * time.Second):
+			monitorMgr.ProbeAllNow(periodicHealthTimeout)
+		}
+	}()
+}
+
+// rollbackToOldConfig attempts to restart with the previous configuration.
+func (m *Manager) rollbackToOldConfig(ctx context.Context, oldCfg *config.Config) {
+	m.mu.RLock()
+	closing := m.closing
+	m.mu.RUnlock()
+	if oldCfg == nil || closing || ctx.Err() != nil {
+		return
+	}
+	if oldCfg.FilePath() != "" {
+		if err := oldCfg.Save(); err != nil {
+			m.logger.Errorf("rollback failed to persist previous config: %v", err)
+		}
+	}
+	m.logger.Warnf("attempting rollback to previous config...")
+	instance, err := m.createBox(ctx, oldCfg)
+	if err != nil {
+		m.logger.Errorf("rollback failed to create box: %v", err)
+		return
+	}
+	if err := instance.Start(); err != nil {
+		m.closeRuntimeInstance(instance)
+		m.logger.Errorf("rollback failed to start box: %v", err)
+		return
+	}
+	m.mu.Lock()
+	if m.closing {
+		m.mu.Unlock()
+		m.closeRuntimeInstance(instance)
+		return
+	}
+	m.currentBox = instance
+	m.cfg = oldCfg
+	m.runtimeCfg = cloneConfig(oldCfg)
+	m.storePortIndex(oldCfg)
+	m.mu.Unlock()
+	// Sync config pointer to monitor server after rollback
+	if m.monitorServer != nil {
+		m.monitorServer.SetConfig(m.cfg)
+	}
+	m.logger.Infof("rollback successful")
+}
+
+func (m *Manager) rebuildMultiPortAssignments(cfg *config.Config) error {
+	if cfg == nil {
+		return errors.New("config is nil")
+	}
+	if cfg.Mode != "multi-port" && cfg.Mode != "hybrid" {
+		return nil
+	}
+
+	base := cfg.MultiPort.BasePort
+	if base == 0 {
+		base = 24000
+	}
+	address := cfg.MultiPort.Address
+	if address == "" {
+		address = "0.0.0.0"
+	}
+
+	// Ports currently held by our own pool — skip OS-availability check on these
+	// so that mid-reload (when our existing listeners still hold their ports)
+	// the allocator doesn't falsely flag them as "occupied".
+	mineSet := make(map[uint16]bool, len(cfg.Nodes))
+	for _, n := range cfg.Nodes {
+		if n.Port > 0 {
+			mineSet[n.Port] = true
+		}
+	}
+
+	used := make(map[uint16]struct{}, len(cfg.Nodes)+1)
+	if cfg.Mode == "hybrid" && cfg.Listener.Port > 0 {
+		used[cfg.Listener.Port] = struct{}{}
+	}
+
+	var skipped []uint16
+	port := uint32(base)
+	for i := range cfg.Nodes {
+		for {
+			if port > 65535 {
+				return fmt.Errorf("no available ports found starting from %d", base)
+			}
+			candidate := uint16(port)
+			if _, ok := used[candidate]; ok {
+				port++
+				continue
+			}
+			if cfg.Mode == "hybrid" && candidate == cfg.Listener.Port {
+				port++
+				continue
+			}
+			if !mineSet[candidate] && !config.IsPortAvailable(address, candidate) {
+				skipped = append(skipped, candidate)
+				port++
+				continue
+			}
+			break
+		}
+		candidate := uint16(port)
+		cfg.Nodes[i].Port = candidate
+		if cfg.Nodes[i].Username == "" {
+			cfg.Nodes[i].Username = cfg.MultiPort.Username
+			cfg.Nodes[i].Password = cfg.MultiPort.Password
+		}
+		used[candidate] = struct{}{}
+		port++
+	}
+	config.RecordPortSkips(skipped)
+	return nil
+}
+
+// Close terminates the active instance and auxiliary components.
+func (m *Manager) Close() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return m.CloseContext(ctx)
+}
+
+func (m *Manager) CloseContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	m.mu.Lock()
+	if !m.closing {
+		m.closing = true
+		m.closeDone = make(chan struct{})
+		if m.cancel != nil {
+			m.cancel()
+		}
+		go m.shutdown(ctx)
+	}
+	done := m.closeDone
+	m.mu.Unlock()
+	select {
+	case <-done:
+		return m.closeErr
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (m *Manager) shutdown(ctx context.Context) {
+	m.mu.RLock()
+	server := m.monitorServer
+	m.mu.RUnlock()
+	var firstErr error
+	if server != nil {
+		shutdownCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			firstErr = err
+		}
+		cancel()
+	}
+
+	// HTTP handlers may need reloadMu. Drain/close HTTP before waiting for
+	// runtime operations, and never close a box while reconciliation uses it.
+	m.reloadMu.Lock()
+	defer m.reloadMu.Unlock()
+	m.mu.Lock()
+	instance := m.currentBox
+	monitorMgr := m.monitorMgr
+	geoRouter := m.geoRouter
+	m.currentBox = nil
+	m.monitorMgr = nil
+	m.monitorServer = nil
+	m.geoRouter = nil
+	m.baseCtx = nil
+	m.mu.Unlock()
+
+	if monitorMgr != nil {
+		monitorMgr.Stop()
+	}
+	if geoRouter != nil {
+		if err := geoRouter.Stop(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if instance != nil {
+		m.runtimeContexts.Delete(instance)
+		if err := instance.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	m.mu.Lock()
+	m.closeErr = firstErr
+	close(m.closeDone)
+	m.mu.Unlock()
+}
+
+func (m *Manager) closeRuntimeInstance(instance *box.Box) {
+	if instance == nil {
+		return
+	}
+	m.runtimeContexts.Delete(instance)
+	_ = instance.Close()
+}
+
+// MonitorManager returns the shared monitor manager.
+func (m *Manager) MonitorManager() *monitor.Manager {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.monitorMgr
+}
+
+// MonitorServer returns the monitor HTTP server.
+func (m *Manager) MonitorServer() *monitor.Server {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.monitorServer
+}
+
+// EnsureMonitor initializes and starts the monitor server before the sing-box
+// instance is started. This allows app-level services to be wired before the
+// WebUI accepts user actions.
+func (m *Manager) EnsureMonitor(ctx context.Context) error {
+	return m.ensureMonitor(ctx)
+}
+
+// startGeoIPRouter starts the GeoIP region-routing HTTP proxy server.
+func (m *Manager) startGeoIPRouter(ctx context.Context, cfg *config.Config) {
+	// Stop existing router if any
+	m.mu.Lock()
+	oldRouter := m.geoRouter
+	m.geoRouter = nil
+	closing := m.closing
+	m.mu.Unlock()
+	if oldRouter != nil {
+		_ = oldRouter.Stop()
+	}
+	if closing {
+		return
+	}
+
+	geoipPort := cfg.GeoIP.Port
+	if geoipPort == 0 {
+		geoipPort = 1221 // Default GeoIP router port
+	}
+	// Avoid conflict with the pool listener port
+	if geoipPort == cfg.Listener.Port {
+		geoipPort = 1221
+		if geoipPort == cfg.Listener.Port {
+			geoipPort = cfg.Listener.Port + 1
+		}
+		log.Printf("⚠️  GeoIP port conflicts with listener port %d, using %d instead", cfg.Listener.Port, geoipPort)
+	}
+	geoipListen := cfg.GeoIP.Listen
+	if geoipListen == "" {
+		geoipListen = cfg.Listener.Address
+	}
+
+	routerCfg := geoip.RouterConfig{
+		Listen:   geoipListen,
+		Port:     geoipPort,
+		Username: cfg.Listener.Username,
+		Password: cfg.Listener.Password,
+	}
+
+	router := geoip.NewRouter(routerCfg, nil)
+
+	// Register region pool dialers
+	for _, region := range geoip.AllRegions() {
+		poolTag := fmt.Sprintf("pool-%s", region)
+		if dialer, ok := pool.GetDialer(poolTag); ok {
+			router.SetPool(region, dialer)
+			log.Printf("   GeoIP: registered pool %s for region /%s", poolTag, region)
+		}
+	}
+
+	// Register global pool dialer (for requests without region path)
+	if dialer, ok := pool.GetDialer(pool.Tag); ok {
+		router.SetGlobalPool(dialer)
+	}
+
+	if err := router.Start(ctx); err != nil {
+		m.logger.Warnf("failed to start GeoIP router: %v", err)
+		return
+	}
+
+	m.mu.Lock()
+	if m.closing {
+		m.mu.Unlock()
+		_ = router.Stop()
+		return
+	}
+	m.geoRouter = router
+	m.mu.Unlock()
+}
+
+// createBox builds a sing-box instance from config.
+// It retries automatically when individual outbounds fail sing-box validation,
+// removing the offending outbound each time.
+func (m *Manager) createBox(ctx context.Context, cfg *config.Config) (*box.Box, error) {
+	if cfg == nil {
+		return nil, errors.New("config is nil")
+	}
+	if m.monitorMgr == nil {
+		return nil, errors.New("monitor manager not initialized")
+	}
+	opts, err := builder.Build(cfg)
+	if err != nil {
+		if failures := builder.ValidateNodeConfigs(cfg); len(failures) > 0 {
+			return nil, &runtimePortValidationError{Failures: failures}
+		}
+		return nil, fmt.Errorf("build sing-box options: %w", err)
+	}
+	if cfg.Mode == "multi-port" || cfg.Mode == "hybrid" {
+		expectedInbounds := len(cfg.Nodes)
+		if cfg.Mode == "hybrid" {
+			expectedInbounds++
+		}
+		if len(opts.Inbounds) < expectedInbounds {
+			if failures := builder.ValidateNodeConfigs(cfg); len(failures) > 0 {
+				return nil, &runtimePortValidationError{Failures: failures}
+			}
+			return nil, fmt.Errorf("runtime build produced %d/%d node listeners", len(opts.Inbounds), expectedInbounds)
+		}
+	}
+
+	maxRetries := len(cfg.Nodes)*3 + 50 // Dynamically scale retries to configuration size
+	outboundErrRe := regexp.MustCompile(`initialize outbound\[(\d+)\]`)
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		inboundRegistry := include.InboundRegistry()
+		outboundRegistry := include.OutboundRegistry()
+		pool.Register(outboundRegistry)
+		dispatch.Register(outboundRegistry)
+		endpointRegistry := include.EndpointRegistry()
+		dnsRegistry := include.DNSTransportRegistry()
+		serviceRegistry := include.ServiceRegistry()
+
+		boxCtx := box.Context(ctx, inboundRegistry, outboundRegistry, endpointRegistry, dnsRegistry, serviceRegistry)
+		boxCtx = monitor.ContextWith(boxCtx, m.monitorMgr)
+
+		instance, err := box.New(box.Options{Context: boxCtx, Options: opts})
+		if err == nil {
+			m.runtimeContexts.Store(instance, boxCtx)
+			if attempt > 0 {
+				log.Printf("✅ sing-box instance created after removing %d invalid outbound(s)", attempt)
+			}
+			return instance, nil
+		}
+
+		// Check if this is an outbound initialization error we can recover from
+		matches := outboundErrRe.FindStringSubmatch(err.Error())
+		if matches == nil {
+			return nil, fmt.Errorf("create sing-box instance: %w", err)
+		}
+
+		idx, convErr := strconv.Atoi(matches[1])
+		if convErr != nil || idx < 0 || idx >= len(opts.Outbounds) {
+			return nil, fmt.Errorf("create sing-box instance: %w", err)
+		}
+
+		badTag := opts.Outbounds[idx].Tag
+		log.Printf("⚠️  Outbound '%s' failed sing-box validation: %v (removing and retrying)", badTag, err)
+
+		// Remove the offending outbound
+		opts.Outbounds = append(opts.Outbounds[:idx], opts.Outbounds[idx+1:]...)
+
+		// Clean up pool outbounds that contained this tag
+		var newOutbounds []option.Outbound
+		var removedPoolTags []string
+		for _, ob := range opts.Outbounds {
+			if ob.Type == pool.Type {
+				if poolOpts, ok := ob.Options.(*pool.Options); ok {
+					poolOpts.Members = removeFromSlice(poolOpts.Members, badTag)
+					delete(poolOpts.Metadata, badTag)
+
+					// If the pool is now empty, remove it to avoid another validation error
+					if len(poolOpts.Members) == 0 {
+						log.Printf("⚠️  Removing empty pool '%s'", ob.Tag)
+						removedPoolTags = append(removedPoolTags, ob.Tag)
+						continue // skip adding this empty pool
+					}
+				}
+			}
+			newOutbounds = append(newOutbounds, ob)
+		}
+		opts.Outbounds = newOutbounds
+
+		// Also remove any routes that pointed to the removed pools or the badTag
+		if (len(removedPoolTags) > 0 || badTag != "") && opts.Route != nil {
+			removedSet := make(map[string]bool)
+			for _, t := range removedPoolTags {
+				removedSet[t] = true
+			}
+			removedSet[badTag] = true
+
+			var newRules []option.Rule
+			for _, r := range opts.Route.Rules {
+				// We expect DefaultRules in our builder
+				if r.Type == C.RuleTypeDefault {
+					outboundTarget := r.DefaultOptions.RuleAction.RouteOptions.Outbound
+					if !removedSet[outboundTarget] {
+						newRules = append(newRules, r)
+					} else {
+						// Remove this rule since it points to a deleted outbound
+					}
+				} else {
+					newRules = append(newRules, r)
+				}
+			}
+			opts.Route.Rules = newRules
+		}
+	}
+
+	return nil, fmt.Errorf("create sing-box instance: too many invalid outbounds (exceeded %d retries)", maxRetries)
+}
+
+// gracefulSwitch swaps the current box with a new one.
+func (m *Manager) gracefulSwitch(newBox *box.Box) error {
+	if newBox == nil {
+		return errors.New("new box is nil")
+	}
+
+	m.mu.Lock()
+	if m.closing {
+		m.mu.Unlock()
+		m.closeRuntimeInstance(newBox)
+		return errors.New("box manager is closed")
+	}
+	old := m.currentBox
+	m.currentBox = newBox
+	drainTimeout := m.drainTimeout
+	m.mu.Unlock()
+
+	if old != nil {
+		go m.drainOldBox(old, drainTimeout)
+	}
+
+	m.logger.Infof("switched to new instance, draining old for %s", drainTimeout)
+	return nil
+}
+
+// drainOldBox waits for drain timeout then closes the old box.
+func (m *Manager) drainOldBox(oldBox *box.Box, timeout time.Duration) {
+	if oldBox == nil {
+		return
+	}
+	if timeout > 0 {
+		time.Sleep(timeout)
+	}
+	m.runtimeContexts.Delete(oldBox)
+	if err := oldBox.Close(); err != nil {
+		m.logger.Errorf("failed to close old instance: %v", err)
+		return
+	}
+	m.logger.Infof("old instance closed after %s drain", timeout)
+}
+
+// removeFromSlice removes an element from a string slice.
+func removeFromSlice(slice []string, element string) []string {
+	result := make([]string, 0, len(slice))
+	for _, s := range slice {
+		if s != element {
+			result = append(result, s)
+		}
+	}
+	return result
+}
+
+// waitForHealthCheck polls until enough nodes are available or timeout.
+func (m *Manager) waitForHealthCheck(timeout time.Duration) error {
+	if m.monitorMgr == nil || m.minAvailableNodes <= 0 {
+		return nil
+	}
+	if timeout <= 0 {
+		timeout = defaultHealthCheckTimeout
+	}
+
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(healthCheckPollInterval)
+	defer ticker.Stop()
+
+	for {
+		available, total := m.availableNodeCount()
+		if available >= m.minAvailableNodes {
+			m.logger.Infof("health check passed: %d/%d nodes available", available, total)
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timeout: %d/%d nodes available (need >= %d)", available, total, m.minAvailableNodes)
+		}
+		<-ticker.C
+	}
+}
+
+// availableNodeCount returns (available, total) node counts.
+func (m *Manager) availableNodeCount() (int, int) {
+	if m.monitorMgr == nil {
+		return 0, 0
+	}
+	snapshots := m.monitorMgr.Snapshot()
+	total := len(snapshots)
+	available := 0
+	for _, snap := range snapshots {
+		if snap.InitialCheckDone && snap.Available {
+			available++
+		}
+	}
+	return available, total
+}
+
+// ensureMonitor initializes monitor manager and server if needed.
+func (m *Manager) ensureMonitor(ctx context.Context) error {
+	m.mu.Lock()
+	if m.closing {
+		m.mu.Unlock()
+		return errors.New("box manager is closed")
+	}
+	if m.baseCtx == nil {
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		m.baseCtx, m.cancel = context.WithCancel(ctx)
+	}
+	ctx = m.baseCtx
+	if m.monitorMgr != nil {
+		m.mu.Unlock()
+		return nil
+	}
+
+	monitorMgr, err := monitor.NewManager(m.monitorCfg)
+	if err != nil {
+		m.mu.Unlock()
+		return fmt.Errorf("init monitor manager: %w", err)
+	}
+	monitorMgr.SetLogger(monitorLoggerAdapter{logger: m.logger})
+	m.monitorMgr = monitorMgr
+
+	var serverToStart *monitor.Server
+	if m.monitorCfg.Enabled {
+		if m.monitorServer == nil {
+			serverToStart = monitor.NewServer(m.monitorCfg, monitorMgr, log.Default())
+			m.monitorServer = serverToStart
+		}
+		// Set config early so WebUI has data before Start() completes
+		if m.monitorServer != nil && m.cfg != nil {
+			m.monitorServer.SetConfig(m.cfg)
+		}
+		// Set NodeManager for config CRUD endpoints
+		if m.monitorServer != nil {
+			m.monitorServer.SetNodeManager(m)
+		}
+		// Note: StartPeriodicHealthCheck is called after nodes are registered in Start()
+	}
+	m.mu.Unlock()
+
+	if serverToStart != nil {
+		serverToStart.Start(ctx)
+	}
+	return nil
+}
+
+// applyConfigSettings extracts runtime settings from config.
+func (m *Manager) applyConfigSettings(cfg *config.Config) {
+	if cfg == nil {
+		return
+	}
+	if cfg.SubscriptionRefresh.DrainTimeout > 0 {
+		m.drainTimeout = cfg.SubscriptionRefresh.DrainTimeout
+	} else if m.drainTimeout == 0 {
+		m.drainTimeout = defaultDrainTimeout
+	}
+	m.minAvailableNodes = cfg.SubscriptionRefresh.MinAvailableNodes
+	m.storePortIndex(cfg)
+}
+
+func (m *Manager) storePortIndex(cfg *config.Config) {
+	ports := make(map[string]uint16, len(cfg.Nodes))
+	for _, node := range cfg.Nodes {
+		if node.URI != "" && node.Port > 0 {
+			ports[node.NodeKey()] = node.Port
+			if node.ChainProfileID == "" {
+				ports[node.URI] = node.Port
+			}
+		}
+	}
+	m.portIndex.Store(ports)
+}
+
+// defaultLogger is the fallback logger using standard log.
+type defaultLogger struct{}
+
+func (defaultLogger) Infof(format string, args ...any) {
+	log.Printf("[boxmgr] "+format, args...)
+}
+
+func (defaultLogger) Warnf(format string, args ...any) {
+	log.Printf("[boxmgr] WARN: "+format, args...)
+}
+
+func (defaultLogger) Errorf(format string, args ...any) {
+	log.Printf("[boxmgr] ERROR: "+format, args...)
+}
+
+// monitorLoggerAdapter adapts Logger to monitor.Logger interface.
+type monitorLoggerAdapter struct {
+	logger Logger
+}
+
+func (a monitorLoggerAdapter) Info(args ...any) {
+	if a.logger != nil {
+		a.logger.Infof("%s", fmt.Sprint(args...))
+	}
+}
+
+func (a monitorLoggerAdapter) Warn(args ...any) {
+	if a.logger != nil {
+		a.logger.Warnf("%s", fmt.Sprint(args...))
+	}
+}
+
+// --- NodeManager interface implementation ---
+
+var errConfigUnavailable = errors.New("config is not initialized")
+
+// ListConfigNodes returns a copy of all configured nodes.
+func (m *Manager) ListConfigNodes(ctx context.Context) ([]config.NodeConfig, error) {
+	_ = ctx
+	m.reloadMu.Lock()
+	defer m.reloadMu.Unlock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.cfg == nil {
+		return nil, errConfigUnavailable
+	}
+	return cloneNodes(m.cfg.Nodes), nil
+}
+
+func (m *Manager) ResolveNodePorts(ctx context.Context, nodeURIs []string) (map[string]uint16, error) {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
+	value := m.portIndex.Load()
+	if value == nil {
+		return nil, errConfigUnavailable
+	}
+	index := value.(map[string]uint16)
+	ports := make(map[string]uint16, len(nodeURIs))
+	for _, uri := range nodeURIs {
+		if port, ok := index[uri]; ok {
+			ports[uri] = port
+		}
+	}
+	return ports, nil
+}
+
+func (m *Manager) RestoreConfigNodes(ctx context.Context, nodes []config.NodeConfig) error {
+	m.reloadMu.Lock()
+	defer m.reloadMu.Unlock()
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	m.mu.Lock()
+	if m.cfg == nil {
+		m.mu.Unlock()
+		return errConfigUnavailable
+	}
+	backup := cloneNodes(m.cfg.Nodes)
+	m.cfg.Nodes = cloneNodes(nodes)
+	if err := m.cfg.Save(); err != nil {
+		m.cfg.Nodes = backup
+		m.mu.Unlock()
+		return fmt.Errorf("save restored nodes: %w", err)
+	}
+	m.mu.Unlock()
+	return m.triggerReloadLocked(ctx)
+}
+
+// CreateNode adds a new node to the config and saves it.
+func (m *Manager) CreateNode(ctx context.Context, node config.NodeConfig) (config.NodeConfig, error) {
+	nodes, err := m.CreateNodes(ctx, []config.NodeConfig{node})
+	if err != nil {
+		return config.NodeConfig{}, err
+	}
+	if len(nodes) == 0 {
+		return config.NodeConfig{}, fmt.Errorf("%w: 节点未创建", monitor.ErrInvalidNode)
+	}
+	return nodes[0], nil
+}
+
+// CreateNodes adds multiple nodes to the config and saves once.
+func (m *Manager) CreateNodes(ctx context.Context, nodes []config.NodeConfig) ([]config.NodeConfig, error) {
+	m.reloadMu.Lock()
+	defer m.reloadMu.Unlock()
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.cfg == nil {
+		return nil, errConfigUnavailable
+	}
+
+	backup := cloneNodes(m.cfg.Nodes)
+	created := make([]config.NodeConfig, 0, len(nodes))
+
+	for _, node := range nodes {
+		normalized, err := m.prepareNodeLocked(node, "")
+		if err != nil {
+			m.cfg.Nodes = backup
+			return nil, err
+		}
+
+		// Determine source: if subscriptions exist, new nodes go to nodes.txt (subscription source)
+		// Otherwise, if nodes_file exists, use file source; else inline
+		if len(m.cfg.Subscriptions) > 0 {
+			normalized.Source = config.NodeSourceSubscription
+		} else if m.cfg.NodesFile != "" {
+			normalized.Source = config.NodeSourceFile
+		} else {
+			normalized.Source = config.NodeSourceInline
+		}
+
+		m.cfg.Nodes = append(m.cfg.Nodes, normalized)
+		created = append(created, normalized)
+	}
+
+	if err := m.cfg.Save(); err != nil {
+		m.cfg.Nodes = backup
+		return nil, fmt.Errorf("save config: %w", err)
+	}
+	return created, nil
+}
+
+// UpdateNode updates an existing node by name and saves the config.
+func (m *Manager) UpdateNode(ctx context.Context, name string, node config.NodeConfig) (config.NodeConfig, error) {
+	m.reloadMu.Lock()
+	defer m.reloadMu.Unlock()
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return config.NodeConfig{}, err
+		}
+	}
+
+	name = strings.TrimSpace(name)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.cfg == nil {
+		return config.NodeConfig{}, errConfigUnavailable
+	}
+
+	idx := m.nodeIndexLocked(name)
+	if idx == -1 {
+		return config.NodeConfig{}, monitor.ErrNodeNotFound
+	}
+
+	normalized, err := m.prepareNodeLocked(node, name)
+	if err != nil {
+		return config.NodeConfig{}, err
+	}
+
+	// Preserve the original source
+	normalized.Source = m.cfg.Nodes[idx].Source
+
+	prev := m.cfg.Nodes[idx]
+	m.cfg.Nodes[idx] = normalized
+	if err := m.cfg.Save(); err != nil {
+		m.cfg.Nodes[idx] = prev
+		return config.NodeConfig{}, fmt.Errorf("save config: %w", err)
+	}
+	return normalized, nil
+}
+
+// UpdateNodes updates multiple existing nodes by old name and saves once.
+func (m *Manager) UpdateNodes(ctx context.Context, nodes map[string]config.NodeConfig) (map[string]config.NodeConfig, error) {
+	m.reloadMu.Lock()
+	defer m.reloadMu.Unlock()
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.cfg == nil {
+		return nil, errConfigUnavailable
+	}
+	if len(nodes) == 0 {
+		return map[string]config.NodeConfig{}, nil
+	}
+
+	backup := cloneNodes(m.cfg.Nodes)
+	updated := make(map[string]config.NodeConfig, len(nodes))
+	for oldName, node := range nodes {
+		oldName = strings.TrimSpace(oldName)
+		if oldName == "" {
+			continue
+		}
+		idx := m.nodeIndexLocked(oldName)
+		if idx == -1 {
+			m.cfg.Nodes = backup
+			return nil, monitor.ErrNodeNotFound
+		}
+		normalized, err := m.prepareNodeLocked(node, oldName)
+		if err != nil {
+			m.cfg.Nodes = backup
+			return nil, err
+		}
+		normalized.Source = m.cfg.Nodes[idx].Source
+		m.cfg.Nodes[idx] = normalized
+		updated[normalized.Name] = normalized
+	}
+
+	if len(updated) == 0 {
+		return updated, nil
+	}
+	if err := m.cfg.Save(); err != nil {
+		m.cfg.Nodes = backup
+		return nil, fmt.Errorf("save config: %w", err)
+	}
+	return updated, nil
+}
+
+// DeleteNode removes a node by name and saves the config.
+func (m *Manager) DeleteNode(ctx context.Context, name string) error {
+	return m.DeleteNodes(ctx, []string{name})
+}
+
+// DeleteNodes removes multiple nodes by name and saves once.
+func (m *Manager) DeleteNodes(ctx context.Context, names []string) error {
+	m.reloadMu.Lock()
+	defer m.reloadMu.Unlock()
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.cfg == nil {
+		return errConfigUnavailable
+	}
+
+	nameSet := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name != "" {
+			nameSet[name] = struct{}{}
+		}
+	}
+	if len(nameSet) == 0 {
+		return monitor.ErrNodeNotFound
+	}
+
+	backup := cloneNodes(m.cfg.Nodes)
+	filtered := make([]config.NodeConfig, 0, len(m.cfg.Nodes))
+	deleted := 0
+	for _, node := range m.cfg.Nodes {
+		if _, ok := nameSet[node.Name]; ok {
+			deleted++
+			continue
+		}
+		filtered = append(filtered, node)
+	}
+	if deleted == 0 {
+		return monitor.ErrNodeNotFound
+	}
+	m.cfg.Nodes = filtered
+	if err := m.cfg.Save(); err != nil {
+		m.cfg.Nodes = backup
+		return fmt.Errorf("save config: %w", err)
+	}
+	return nil
+}
+
+// ReorderNodes moves the named nodes to the front in the given order and saves
+// the config. In multi-port/hybrid mode it also reassigns sequential ports so
+// group ordering in the WebUI maps to visible port ranges.
+func (m *Manager) ReorderNodes(ctx context.Context, names []string) error {
+	m.reloadMu.Lock()
+	defer m.reloadMu.Unlock()
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.cfg == nil {
+		return errConfigUnavailable
+	}
+
+	backup := cloneNodes(m.cfg.Nodes)
+	byName := make(map[string]config.NodeConfig, len(m.cfg.Nodes))
+	for _, node := range m.cfg.Nodes {
+		byName[node.Name] = node
+	}
+
+	reordered := make([]config.NodeConfig, 0, len(m.cfg.Nodes))
+	seen := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		node, ok := byName[name]
+		if !ok {
+			continue
+		}
+		if _, exists := seen[name]; exists {
+			continue
+		}
+		reordered = append(reordered, node)
+		seen[name] = struct{}{}
+	}
+	for _, node := range m.cfg.Nodes {
+		if _, ok := seen[node.Name]; ok {
+			continue
+		}
+		reordered = append(reordered, node)
+	}
+	m.cfg.Nodes = reordered
+
+	if m.cfg.Mode == "multi-port" || m.cfg.Mode == "hybrid" {
+		if err := m.assignSequentialPortsLocked(); err != nil {
+			m.cfg.Nodes = backup
+			return err
+		}
+	}
+
+	if err := m.cfg.Save(); err != nil {
+		m.cfg.Nodes = backup
+		return fmt.Errorf("save config: %w", err)
+	}
+	return nil
+}
+
+// TriggerReload reloads the sing-box instance with current config.
+func (m *Manager) TriggerReload(ctx context.Context) error {
+	m.reloadMu.Lock()
+	defer m.reloadMu.Unlock()
+	return m.triggerReloadLocked(ctx)
+}
+
+func (m *Manager) triggerReloadLocked(ctx context.Context) error {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+
+	m.mu.RLock()
+	if m.closing {
+		m.mu.RUnlock()
+		return errors.New("box manager is closed")
+	}
+	cfgCopy := m.copyConfigLocked()
+	notStarted := m.currentBox == nil
+	runtimeCfg := cloneConfig(m.runtimeCfg)
+	m.mu.RUnlock()
+
+	if cfgCopy == nil {
+		return errConfigUnavailable
+	}
+	if len(cfgCopy.Nodes) == 0 {
+		return m.enterEmptyRuntime(cfgCopy)
+	}
+	if notStarted && (cfgCopy.Mode == "multi-port" || cfgCopy.Mode == "hybrid") {
+		if err := m.rebuildMultiPortAssignments(cfgCopy); err != nil {
+			return fmt.Errorf("rebuild multi-port assignments: %w", err)
+		}
+		if cfgCopy.FilePath() != "" {
+			if err := cfgCopy.Save(); err != nil {
+				return fmt.Errorf("save rebuilt config: %w", err)
+			}
+		}
+	}
+	if notStarted {
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		m.mu.Lock()
+		m.cfg = cfgCopy
+		m.mu.Unlock()
+		return m.startLocked(ctx)
+	}
+	if canReconcileMultiPort(runtimeCfg, cfgCopy) {
+		if err := m.reconcileMultiPort(runtimeCfg, cfgCopy); err == nil {
+			return nil
+		} else {
+			m.logger.Warnf("incremental multi-port reconcile failed, falling back to full reload: %v", err)
+		}
+	}
+	return m.reloadLocked(cfgCopy)
+}
+
+func (m *Manager) ApplyRestoredConfig(ctx context.Context, restored *config.Config) error {
+	m.reloadMu.Lock()
+	defer m.reloadMu.Unlock()
+	if restored == nil {
+		return errors.New("restored config is nil")
+	}
+	m.mu.RLock()
+	if m.closing {
+		m.mu.RUnlock()
+		return errors.New("box manager is closed")
+	}
+	running := m.currentBox != nil
+	baseCtx := m.baseCtx
+	m.mu.RUnlock()
+	if len(restored.Nodes) > 0 {
+		if running {
+			return m.reloadLocked(restored)
+		}
+		if baseCtx == nil {
+			baseCtx = context.Background()
+		}
+		m.mu.Lock()
+		m.cfg = restored
+		m.mu.Unlock()
+		return m.startLocked(baseCtx)
+	}
+
+	return m.enterEmptyRuntime(restored)
+}
+
+func (m *Manager) enterEmptyRuntime(cfg *config.Config) error {
+	if cfg == nil {
+		return errConfigUnavailable
+	}
+	m.mu.RLock()
+	oldBox := m.currentBox
+	m.mu.RUnlock()
+	if oldBox != nil {
+		if err := oldBox.Close(); err != nil {
+			return fmt.Errorf("stop current instance: %w", err)
+		}
+		m.runtimeContexts.Delete(oldBox)
+	}
+
+	pool.ResetSharedStateStore()
+	m.mu.Lock()
+	m.currentBox = nil
+	m.cfg = cfg
+	m.runtimeCfg = cloneConfig(cfg)
+	m.applyConfigSettings(cfg)
+	geoRouter := m.geoRouter
+	m.geoRouter = nil
+	monitorMgr := m.monitorMgr
+	monitorServer := m.monitorServer
+	m.mu.Unlock()
+
+	if geoRouter != nil {
+		geoRouter.Stop()
+	}
+	if monitorMgr != nil {
+		monitorMgr.StopPeriodicHealthCheck()
+		monitorMgr.ClearNodes()
+	}
+	if monitorServer != nil {
+		monitorServer.SetConfig(cfg)
+	}
+	m.logger.Infof("proxy runtime stopped; management remains available with 0 nodes")
+	return nil
+}
+
+// ReloadWithPortMap is kept for compatibility.
+// Port assignments are recomputed from base_port during Reload so the runtime
+// ports always match the config file and the WebUI.
+func (m *Manager) ReloadWithPortMap(newCfg *config.Config, portMap map[string]uint16) error {
+	return m.Reload(newCfg)
+}
+
+// CurrentPortMap returns the current port mapping from the active configuration.
+func (m *Manager) CurrentPortMap() map[string]uint16 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.cfg == nil {
+		return nil
+	}
+	return m.cfg.BuildPortMap()
+}
+
+func (m *Manager) CurrentConfig() *config.Config {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.copyConfigLocked()
+}
+
+// RebuildPortAssignments repacks multi-port assignments sequentially from
+// base_port. Intended to be called once at startup after the caller has
+// finalized cfg.Nodes (e.g. after filtering to pool members), so the first
+// sing-box instance is created with deterministic, contiguous ports.
+func (m *Manager) RebuildPortAssignments() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.cfg == nil {
+		return errConfigUnavailable
+	}
+	backup := cloneNodes(m.cfg.Nodes)
+	if err := m.rebuildMultiPortAssignments(m.cfg); err != nil {
+		return err
+	}
+	if m.cfg.FilePath() != "" {
+		if err := m.cfg.Save(); err != nil {
+			m.cfg.Nodes = backup
+			return fmt.Errorf("save rebuilt config: %w", err)
+		}
+	}
+	m.storePortIndex(m.cfg)
+	return nil
+}
+
+// --- Helper functions ---
+
+var portBindErrorRegex = regexp.MustCompile(`listen tcp[46]? \S+:(\d+): bind: (?:address already in use|Only one usage of each socket address)`)
+
+// extractPortFromBindError extracts the port number from a bind error message.
+func extractPortFromBindError(err error) uint16 {
+	if err == nil {
+		return 0
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Op == "listen" {
+		// Windows reports WSAEADDRINUSE rather than syscall.EADDRINUSE.
+		inUse := errors.Is(err, syscall.EADDRINUSE) || runtime.GOOS == "windows" && errors.Is(err, syscall.Errno(10048))
+		if addr, ok := opErr.Addr.(*net.TCPAddr); ok && inUse && addr.Port > 0 && addr.Port <= 65535 {
+			return uint16(addr.Port)
+		}
+	}
+	matches := portBindErrorRegex.FindStringSubmatch(err.Error())
+	if len(matches) < 2 {
+		return 0
+	}
+	var port int
+	fmt.Sscanf(matches[1], "%d", &port)
+	if port > 0 && port <= 65535 {
+		return uint16(port)
+	}
+	return 0
+}
+
+// reassignConflictingPort finds the node using the conflicting port and assigns a new port.
+func reassignConflictingPort(cfg *config.Config, conflictPort uint16) bool {
+	return reassignConflictingPortWithAvailability(cfg, conflictPort, config.IsPortAvailable)
+}
+
+func reassignConflictingPortWithAvailability(cfg *config.Config, conflictPort uint16, available func(string, uint16) bool) bool {
+	if cfg == nil || conflictPort == 0 || available == nil {
+		return false
+	}
+	// Build set of used ports
+	usedPorts := make(map[uint16]bool)
+	if cfg.Mode == "hybrid" {
+		usedPorts[cfg.Listener.Port] = true
+	}
+	for _, node := range cfg.Nodes {
+		usedPorts[node.Port] = true
+	}
+
+	// Find and reassign the conflicting node
+	for idx := range cfg.Nodes {
+		if cfg.Nodes[idx].Port == conflictPort {
+			address := cfg.MultiPort.Address
+			if address == "" {
+				address = "0.0.0.0"
+			}
+			for candidate := uint32(conflictPort) + 1; candidate <= 65535; candidate++ {
+				newPort := uint16(candidate)
+				if usedPorts[newPort] || !available(address, newPort) {
+					continue
+				}
+				log.Printf("⚠️  Port %d in use, reassigning node %q to port %d", conflictPort, cfg.Nodes[idx].Name, newPort)
+				cfg.Nodes[idx].Port = newPort
+				return true
+			}
+			log.Printf("❌ No available port found for node %q", cfg.Nodes[idx].Name)
+			return false
+		}
+	}
+	return false
+}
+
+func cloneNodes(nodes []config.NodeConfig) []config.NodeConfig {
+	if len(nodes) == 0 {
+		return []config.NodeConfig{} // Return empty slice, not nil, for proper JSON serialization
+	}
+	out := make([]config.NodeConfig, len(nodes))
+	copy(out, nodes)
+	return out
+}
+
+func cloneConfig(cfg *config.Config) *config.Config {
+	if cfg == nil {
+		return nil
+	}
+	cloned := *cfg
+	cloned.Nodes = cloneNodes(cfg.Nodes)
+	cloned.Subscriptions = append([]string(nil), cfg.Subscriptions...)
+	cloned.ChainProfiles = append([]proxychain.Profile(nil), cfg.ChainProfiles...)
+	cloned.SetFilePath(cfg.FilePath())
+	return &cloned
+}
+
+func (m *Manager) copyConfigLocked() *config.Config {
+	return cloneConfig(m.cfg)
+}
+
+type runtimeNodeSpec struct {
+	node        config.NodeConfig
+	outboundTag string
+	inboundTag  string
+}
+
+func runtimeNodeSpecs(nodes []config.NodeConfig) map[string]runtimeNodeSpec {
+	result := make(map[string]runtimeNodeSpec, len(nodes))
+	used := make(map[string]int, len(nodes))
+	for index, node := range nodes {
+		base := builder.NodeTag(node.Name)
+		if base == "" {
+			base = fmt.Sprintf("node-%d", index+1)
+		}
+		tag := base
+		if count := used[base]; count > 0 {
+			count++
+			used[base] = count
+			tag = fmt.Sprintf("%s-%d", base, count)
+		} else {
+			used[base] = 1
+		}
+		result[tag] = runtimeNodeSpec{node: node, outboundTag: tag, inboundTag: "in-" + tag}
+	}
+	return result
+}
+
+func canReconcileMultiPort(current, desired *config.Config) bool {
+	if current == nil || desired == nil || current.Mode != "multi-port" || desired.Mode != "multi-port" {
+		return false
+	}
+	if len(current.ChainProfiles) > 0 || len(desired.ChainProfiles) > 0 {
+		return false
+	}
+	return current.MultiPort == desired.MultiPort &&
+		current.Listener == desired.Listener &&
+		current.Pool == desired.Pool &&
+		current.GeoIP == desired.GeoIP &&
+		current.Log == desired.Log &&
+		current.LogLevel == desired.LogLevel &&
+		current.SkipCertVerify == desired.SkipCertVerify
+}
+
+func (m *Manager) reconcileMultiPort(current, desired *config.Config) error {
+	m.mu.RLock()
+	instance := m.currentBox
+	m.mu.RUnlock()
+	if instance == nil {
+		return errors.New("manager not started")
+	}
+	runtimeCtx, ok := m.runtimeContexts.Load(instance)
+	if !ok {
+		return errors.New("runtime context unavailable")
+	}
+	dispatchOutbound, loaded := instance.Outbound().Outbound(dispatch.Tag)
+	if !loaded {
+		return errors.New("multi-port dispatcher unavailable")
+	}
+	updater, ok := dispatchOutbound.(dispatch.MappingUpdater)
+	if !ok {
+		return errors.New("multi-port dispatcher does not support updates")
+	}
+
+	currentSpecs := runtimeNodeSpecs(current.Nodes)
+	desiredSpecs := runtimeNodeSpecs(desired.Nodes)
+	removeTags := make([]string, 0)
+	addTags := make([]string, 0)
+	for tag, oldSpec := range currentSpecs {
+		newSpec, exists := desiredSpecs[tag]
+		if !exists || newSpec.node != oldSpec.node {
+			removeTags = append(removeTags, tag)
+		}
+	}
+	for tag, newSpec := range desiredSpecs {
+		oldSpec, exists := currentSpecs[tag]
+		if !exists || newSpec.node != oldSpec.node {
+			addTags = append(addTags, tag)
+		}
+	}
+	if len(removeTags) == 0 && len(addTags) == 0 {
+		m.publishIncrementalConfig(desired)
+		return nil
+	}
+
+	type preparedNode struct {
+		outbound option.Outbound
+		inbound  option.Inbound
+	}
+	prepared := make(map[string]preparedNode, len(addTags))
+	for _, tag := range addTags {
+		spec := desiredSpecs[tag]
+		outbound, err := builder.BuildSingleNodeOutbound(tag, spec.node.URI, desired.SkipCertVerify)
+		if err != nil {
+			return fmt.Errorf("build outbound %s: %w", tag, err)
+		}
+		inbound, err := builder.BuildMultiPortInbound(desired, spec.node, tag)
+		if err != nil {
+			return fmt.Errorf("build inbound %s: %w", spec.inboundTag, err)
+		}
+		prepared[tag] = preparedNode{outbound: outbound, inbound: inbound}
+	}
+
+	for _, tag := range removeTags {
+		if err := instance.Inbound().Remove(currentSpecs[tag].inboundTag); err != nil {
+			return fmt.Errorf("remove inbound %s: %w", currentSpecs[tag].inboundTag, err)
+		}
+	}
+	for _, tag := range removeTags {
+		if err := instance.Outbound().Remove(tag); err != nil {
+			return fmt.Errorf("remove outbound %s: %w", tag, err)
+		}
+	}
+
+	logger := m.runtimeLogFactory.NewLogger("runtime/reconcile")
+	ctx := runtimeCtx.(context.Context)
+	for _, tag := range addTags {
+		outbound := prepared[tag].outbound
+		if err := instance.Outbound().Create(ctx, instance.Router(), logger, outbound.Tag, outbound.Type, outbound.Options); err != nil {
+			return fmt.Errorf("create outbound %s: %w", tag, err)
+		}
+	}
+	mappings := make(map[string]string, len(desiredSpecs))
+	for tag, spec := range desiredSpecs {
+		mappings[spec.inboundTag] = tag
+	}
+	updater.UpdateMappings(mappings)
+	for _, tag := range addTags {
+		inbound := prepared[tag].inbound
+		if err := instance.Inbound().Create(ctx, instance.Router(), logger, inbound.Tag, inbound.Type, inbound.Options); err != nil {
+			return fmt.Errorf("create inbound %s: %w", inbound.Tag, err)
+		}
+	}
+
+	m.publishIncrementalConfig(desired)
+	m.logger.Infof("incremental multi-port reconcile completed: added=%d removed=%d total=%d", len(addTags), len(removeTags), len(desired.Nodes))
+	return nil
+}
+
+func (m *Manager) publishIncrementalConfig(cfg *config.Config) {
+	m.mu.Lock()
+	m.cfg = cfg
+	m.runtimeCfg = cloneConfig(cfg)
+	m.applyConfigSettings(cfg)
+	server := m.monitorServer
+	m.mu.Unlock()
+	if server != nil {
+		server.SetConfig(cfg)
+	}
+}
+
+func (m *Manager) nodeIndexLocked(name string) int {
+	for idx, node := range m.cfg.Nodes {
+		if node.Name == name {
+			return idx
+		}
+	}
+	return -1
+}
+
+func (m *Manager) portInUseLocked(port uint16, currentName string) bool {
+	if port == 0 {
+		return false
+	}
+	for _, node := range m.cfg.Nodes {
+		if node.Name == currentName {
+			continue
+		}
+		if node.Port == port {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Manager) currentNodeHasPortLocked(port uint16, currentName string) bool {
+	if port == 0 || currentName == "" {
+		return false
+	}
+	for _, node := range m.cfg.Nodes {
+		if node.Name == currentName && node.Port == port {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Manager) nextAvailablePortLocked() uint16 {
+	base := m.cfg.MultiPort.BasePort
+	if base == 0 {
+		base = 24000
+	}
+	address := m.cfg.MultiPort.Address
+	if address == "" {
+		address = "0.0.0.0"
+	}
+	used := make(map[uint16]struct{}, len(m.cfg.Nodes))
+	var maxPort uint32
+	for _, node := range m.cfg.Nodes {
+		if node.Port > 0 {
+			used[node.Port] = struct{}{}
+			if uint32(node.Port) > maxPort {
+				maxPort = uint32(node.Port)
+			}
+		}
+	}
+	// New nodes get the next port after the current tail so growth stays sequential.
+	port := uint32(base)
+	if maxPort >= uint32(base) {
+		port = maxPort + 1
+	}
+	var skipped []uint16
+	for ; port <= 65535; port++ {
+		candidate := uint16(port)
+		if _, taken := used[candidate]; !taken && !(m.cfg.Mode == "hybrid" && candidate == m.cfg.Listener.Port) {
+			if config.IsPortAvailable(address, candidate) {
+				if len(skipped) > 0 {
+					config.RecordPortSkips(skipped)
+				}
+				return candidate
+			}
+			skipped = append(skipped, candidate)
+		}
+	}
+	if len(skipped) > 0 {
+		config.RecordPortSkips(skipped)
+	}
+	return 0
+}
+
+func (m *Manager) assignSequentialPortsLocked() error {
+	base := m.cfg.MultiPort.BasePort
+	if base == 0 {
+		base = 24000
+	}
+	address := m.cfg.MultiPort.Address
+	if address == "" {
+		address = "0.0.0.0"
+	}
+	// Pre-snapshot of ports we currently hold — skip OS check on these.
+	mineSet := make(map[uint16]bool, len(m.cfg.Nodes))
+	for _, node := range m.cfg.Nodes {
+		if node.Port > 0 {
+			mineSet[node.Port] = true
+		}
+	}
+	assigned := make(map[uint16]struct{}, len(m.cfg.Nodes))
+	var skipped []uint16
+	port := uint32(base)
+	for i := range m.cfg.Nodes {
+		assignedNow := false
+		m.cfg.Nodes[i].Port = 0
+		for port <= 65535 {
+			candidate := uint16(port)
+			if _, ok := assigned[candidate]; ok {
+				port++
+				continue
+			}
+			if m.cfg.Mode == "hybrid" && candidate == m.cfg.Listener.Port {
+				port++
+				continue
+			}
+			if !mineSet[candidate] && !config.IsPortAvailable(address, candidate) {
+				skipped = append(skipped, candidate)
+				port++
+				continue
+			}
+			m.cfg.Nodes[i].Port = candidate
+			assigned[candidate] = struct{}{}
+			port++
+			assignedNow = true
+			break
+		}
+		if !assignedNow {
+			return fmt.Errorf("no available ports found starting from %d", base)
+		}
+		if m.cfg.Nodes[i].Username == "" {
+			m.cfg.Nodes[i].Username = m.cfg.MultiPort.Username
+			m.cfg.Nodes[i].Password = m.cfg.MultiPort.Password
+		}
+	}
+	config.RecordPortSkips(skipped)
+	return nil
+}
+
+func (m *Manager) prepareNodeLocked(node config.NodeConfig, currentName string) (config.NodeConfig, error) {
+	node.Name = strings.TrimSpace(node.Name)
+	node.URI = strings.TrimSpace(node.URI)
+
+	if node.URI == "" {
+		return config.NodeConfig{}, fmt.Errorf("%w: URI 不能为空", monitor.ErrInvalidNode)
+	}
+
+	// Extract name from URI if not provided
+	if node.Name == "" {
+		if currentName != "" {
+			node.Name = currentName
+		} else {
+			node.Name = config.ExtractNodeName(node.URI)
+		}
+		// Fallback to auto-generated name
+		if node.Name == "" {
+			node.Name = fmt.Sprintf("node-%d", len(m.cfg.Nodes)+1)
+		}
+	}
+
+	// Check for name conflict (excluding current node when updating)
+	if idx := m.nodeIndexLocked(node.Name); idx != -1 {
+		if currentName == "" || m.cfg.Nodes[idx].Name != currentName {
+			return config.NodeConfig{}, fmt.Errorf("%w: 节点 %s 已存在", monitor.ErrNodeConflict, node.Name)
+		}
+	}
+
+	// Handle multi-port mode specifics
+	if m.cfg.Mode == "multi-port" || m.cfg.Mode == "hybrid" {
+		if node.Port == 0 {
+			node.Port = m.nextAvailablePortLocked()
+			if node.Port == 0 {
+				return config.NodeConfig{}, fmt.Errorf("%w: 没有可用端口", monitor.ErrNodeConflict)
+			}
+		} else if m.portInUseLocked(node.Port, currentName) {
+			return config.NodeConfig{}, fmt.Errorf("%w: 端口 %d 已被占用", monitor.ErrNodeConflict, node.Port)
+		} else if !m.currentNodeHasPortLocked(node.Port, currentName) && !config.IsPortAvailable(m.cfg.MultiPort.Address, node.Port) {
+			return config.NodeConfig{}, fmt.Errorf("%w: 端口 %d 已被系统占用", monitor.ErrNodeConflict, node.Port)
+		}
+		if node.Username == "" {
+			node.Username = m.cfg.MultiPort.Username
+			node.Password = m.cfg.MultiPort.Password
+		}
+	}
+
+	return node, nil
+}

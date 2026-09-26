@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+
+# IDE / OS
+.idea/
+.vscode/
+.claude/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Browser runtime
+browser_profiles/
+browser_data/
+user_data/
+
+# Logs
+*.log
+logs/
+
+# ========== 私密 / 本地数据（切勿提交）==========
+# 账号与 token 结果
+not_oauth2.txt
+oauth2.txt
+*.token.txt
+*credentials*
+*secret*
+
+# 本地配置（可提交 config.example.json）
+config.json
+
+# 其它可能含账号的导出
+Results/
+*.csv
+*.xlsx

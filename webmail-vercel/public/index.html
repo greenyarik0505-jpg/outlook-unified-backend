@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Outlook Webmail & OTP Viewer</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%233b82f6'><path d='M20 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 4-8 5-8-5V6l8 5 8-5v2z'/></svg>">
+  <link rel="stylesheet" href="style.css">
+  <script src="https://unpkg.com/lucide@latest"></script>
+</head>
+<body>
+  <div class="app-container">
+    <!-- Left Sidebar: Accounts & Folders -->
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-icon">⚡</div>
+        <div class="brand-text">
+          <h2>Webmail Outlook</h2>
+          <span>Vercel Edition</span>
+        </div>
+      </div>
+
+      <div class="sidebar-actions">
+        <button class="btn btn-primary" id="btn-open-connect">
+          <i data-lucide="plus-circle" style="width:16px;height:16px;"></i>
+          <span>Добавить аккаунт</span>
+        </button>
+        <button class="btn btn-secondary" id="btn-open-settings">
+          <i data-lucide="server" style="width:16px;height:16px;"></i>
+          <span>Бекенд (Oracle/Render)</span>
+        </button>
+      </div>
+
+      <div class="section-label">
+        <span>Папки</span>
+      </div>
+      <ul class="nav-folders">
+        <li class="nav-item active" data-folder="inbox">
+          <i data-lucide="inbox" style="width:16px;height:16px;"></i>
+          <span>Входящие</span>
+          <span class="nav-badge" id="badge-inbox">0</span>
+        </li>
+        <li class="nav-item" data-folder="junkemail">
+          <i data-lucide="alert-octagon" style="width:16px;height:16px;"></i>
+          <span>Спам</span>
+        </li>
+        <li class="nav-item" data-folder="sentitems">
+          <i data-lucide="send" style="width:16px;height:16px;"></i>
+          <span>Отправленные</span>
+        </li>
+        <li class="nav-item" data-folder="deleteditems">
+          <i data-lucide="trash-2" style="width:16px;height:16px;"></i>
+          <span>Корзина</span>
+        </li>
+      </ul>
+
+      <div class="section-label" style="margin-top: 10px;">
+        <span>Аккаунты</span>
+        <button class="btn btn-secondary btn-sm" id="btn-sync-accounts" title="Обновить с сервера" style="padding:2px 6px;">
+          <i data-lucide="refresh-cw" style="width:12px;height:12px;"></i>
+        </button>
+      </div>
+      <div class="account-list" id="accounts-container">
+        <!-- Rendered dynamically -->
+      </div>
+    </aside>
+
+    <!-- Middle: Message List -->
+    <section class="mail-list-panel">
+      <div class="list-topbar">
+        <div class="search-box">
+          <i data-lucide="search" style="width:15px;height:15px;color:var(--text-dim);"></i>
+          <input type="text" id="search-input" placeholder="Поиск писем (тема, отправитель)...">
+        </div>
+        <div class="list-controls">
+          <div style="display:flex;align-items:center;gap:6px;">
+            <span>Автообновление:</span>
+            <select class="refresh-select" id="auto-refresh-select">
+              <option value="0">Выкл</option>
+              <option value="5">5 сек</option>
+              <option value="10" selected>10 сек</option>
+              <option value="30">30 сек</option>
+            </select>
+          </div>
+          <button class="btn btn-secondary btn-sm" id="btn-manual-refresh" title="Обновить сейчас">
+            <i data-lucide="refresh-cw" style="width:13px;height:13px;"></i>
+          </button>
+        </div>
+      </div>
+
+      <div class="messages-scroll" id="messages-container">
+        <div style="padding: 40px 20px; text-align: center; color: var(--text-dim);">
+          Выберите или добавьте аккаунт слева для чтения почты
+        </div>
+      </div>
+    </section>
+
+    <!-- Right: Message Detail Viewer -->
+    <main class="mail-view-panel" id="view-panel">
+      <div class="view-empty" id="view-empty">
+        <div class="view-empty-icon">
+          <i data-lucide="mail-open" style="width:28px;height:28px;color:var(--text-dim);"></i>
+        </div>
+        <h3>Письмо не выбрано</h3>
+        <p>Кликните по сообщению из списка, чтобы просмотреть его содержимое</p>
+      </div>
+
+      <div id="view-content" style="display: none; height: 100%; flex-direction: column;">
+        <header class="view-header">
+          <div class="view-subject-row">
+            <h1 class="view-subject" id="view-subject">Тема письма</h1>
+            <div style="display:flex;gap:8px;">
+              <button class="btn btn-secondary btn-sm" id="btn-copy-body" title="Скопировать текст письма">
+                <i data-lucide="copy" style="width:14px;height:14px;"></i>
+                <span>Копия</span>
+              </button>
+              <button class="btn btn-secondary btn-sm" id="btn-raw-open" title="Открыть в отдельном окне">
+                <i data-lucide="external-link" style="width:14px;height:14px;"></i>
+              </button>
+            </div>
+          </div>
+          <div class="view-meta-row">
+            <div class="avatar-initial" id="view-avatar">?</div>
+            <div class="view-sender-info">
+              <span class="view-from-name" id="view-from-name">Отправитель</span>
+              <span class="view-from-email" id="view-from-email">sender@example.com</span>
+            </div>
+            <div style="margin-left: auto; font-size: 12px; color: var(--text-dim);" id="view-date">
+              --:--
+            </div>
+          </div>
+        </header>
+
+        <!-- Dynamic OTP Banner -->
+        <div class="otp-banner" id="view-otp-banner" style="display: none;">
+          <div class="otp-banner-left">
+            <div class="otp-icon-wrap">
+              <i data-lucide="key" style="width:22px;height:22px;"></i>
+            </div>
+            <div>
+              <div class="otp-text-label">Код подтверждения (OTP)</div>
+              <div class="otp-code-value" id="otp-display-value">------</div>
+            </div>
+          </div>
+          <div style="display:flex;gap:10px;">
+            <button class="btn btn-primary" id="btn-copy-otp">
+              <i data-lucide="copy" style="width:15px;height:15px;"></i>
+              <span>Скопировать код</span>
+            </button>
+            <a href="#" target="_blank" class="btn btn-secondary" id="btn-open-link" style="display: none;">
+              <i data-lucide="link" style="width:15px;height:15px;"></i>
+              <span>Перейти по ссылке</span>
+            </a>
+          </div>
+        </div>
+
+        <!-- View Tabs -->
+        <div class="view-tabs">
+          <div class="view-tab active" data-tab="html">HTML Просмотр</div>
+          <div class="view-tab" data-tab="text">Текст</div>
+        </div>
+
+        <div class="view-body-wrapper">
+          <iframe class="email-iframe" id="view-iframe" sandbox="allow-same-origin allow-popups"></iframe>
+          <pre class="email-text-content" id="view-text" style="display: none;"></pre>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <!-- Connect Account Modal -->
+  <div class="modal-overlay" id="modal-connect">
+    <div class="modal-card">
+      <div class="modal-head">
+        <h3>Подключить аккаунт Outlook</h3>
+        <button class="btn btn-secondary btn-sm" onclick="closeModal('modal-connect')">✕</button>
+      </div>
+      <div class="modal-body">
+        <p style="font-size:13px;color:var(--text-muted);">
+          Введите строку формата <code>email----pass----client_id----refresh_token</code> или просто email и refresh_token.
+        </p>
+        <div class="form-group">
+          <label>Строка аккаунта (быстрая вставка):</label>
+          <textarea id="input-account-line" rows="3" placeholder="user@outlook.com----password----d3590ed6-52b3-4102-aeff-aad2292ab01c----M.R3_BAY.-C..."></textarea>
+        </div>
+        <div style="text-align: center; color: var(--text-dim); font-size: 11px;">ИЛИ ПО ПОЛЯМ</div>
+        <div class="form-group">
+          <label>Email адрес:</label>
+          <input type="text" id="input-email" placeholder="example@outlook.com">
+        </div>
+        <div class="form-group">
+          <label>Client ID (по умолчанию Microsoft Office):</label>
+          <input type="text" id="input-client-id" value="d3590ed6-52b3-4102-aeff-aad2292ab01c">
+        </div>
+        <div class="form-group">
+          <label>Refresh Token:</label>
+          <textarea id="input-refresh-token" rows="3" placeholder="M.R3_BAY..."></textarea>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="closeModal('modal-connect')">Отмена</button>
+        <button class="btn btn-primary" id="btn-save-account">Сохранить и подключиться</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Backend Settings Modal -->
+  <div class="modal-overlay" id="modal-settings">
+    <div class="modal-card">
+      <div class="modal-head">
+        <h3>Подключение к Бекенду (Oracle / Render)</h3>
+        <button class="btn btn-secondary btn-sm" onclick="closeModal('modal-settings')">✕</button>
+      </div>
+      <div class="modal-body">
+        <p style="font-size:13px;color:var(--text-muted);">
+          Если у вас запущен авторег на Oracle VPS или Render, вкажите адрес сервера для автоматической синхронизации всех аккаунтов.
+        </p>
+        <div class="form-group">
+          <label>URL сервера (например, <code>http://129.150.12.34:18080</code> или <code>https://my-app.onrender.com</code>):</label>
+          <input type="text" id="input-backend-url" placeholder="http://ip_or_domain:18080">
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="closeModal('modal-settings')">Отмена</button>
+        <button class="btn btn-primary" id="btn-save-settings">Сохранить настройки</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast notifications -->
+  <div class="toast-container" id="toast-container"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

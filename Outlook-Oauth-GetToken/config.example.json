@@ -1,0 +1,14 @@
+{
+    "input_file": "not_oauth2.txt",
+    "output_file": "oauth2.txt",
+    "concurrent": 2,
+    "proxy": {
+        "mode": "single",
+        "type": "http",
+        "host": "127.0.0.1",
+        "single_port": 7890,
+        "port_start": 24000,
+        "port_end": 24005,
+        "max_per_proxy": 20
+    }
+}

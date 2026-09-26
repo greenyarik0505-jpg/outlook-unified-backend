@@ -1,0 +1,10 @@
+{
+  "name": "outlook-webmail",
+  "version": "1.0.0",
+  "description": "Standalone Outlook Webmail & OTP Viewer for Vercel",
+  "scripts": {
+    "start": "npx serve public"
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}

@@ -1,0 +1,187 @@
+package pool
+
+import (
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"easy_proxies/internal/monitor"
+)
+
+// sharedMemberState holds failure/blacklist state shared across all pool instances.
+// This enables hybrid mode where pool and multi-port modes share the same node state.
+type sharedMemberState struct {
+	mu               sync.Mutex
+	failures         int
+	blacklisted      bool
+	blacklistedUntil time.Time
+	halfOpen         bool
+	entry            atomic.Pointer[monitor.EntryHandle]
+	active           atomic.Int32
+}
+
+var sharedStateStore sync.Map // map[tag]*sharedMemberState
+
+// acquireSharedState returns the shared state for a tag, creating if needed.
+func acquireSharedState(tag string) *sharedMemberState {
+	if v, ok := sharedStateStore.Load(tag); ok {
+		return v.(*sharedMemberState)
+	}
+	state := &sharedMemberState{}
+	actual, _ := sharedStateStore.LoadOrStore(tag, state)
+	return actual.(*sharedMemberState)
+}
+
+// lookupSharedState returns the shared state if it exists.
+func lookupSharedState(tag string) (*sharedMemberState, bool) {
+	v, ok := sharedStateStore.Load(tag)
+	if !ok {
+		return nil, false
+	}
+	return v.(*sharedMemberState), true
+}
+
+// ResetSharedStateStore clears all shared state (used during config reload).
+func ResetSharedStateStore() {
+	sharedStateStore.Range(func(key, _ any) bool {
+		sharedStateStore.Delete(key)
+		return true
+	})
+	ResetDialerRegistry()
+}
+
+func (s *sharedMemberState) attachEntry(entry *monitor.EntryHandle) {
+	if entry == nil {
+		return
+	}
+	s.entry.Store(entry)
+}
+
+func (s *sharedMemberState) entryHandle() *monitor.EntryHandle {
+	return s.entry.Load()
+}
+
+// recordFailure increments failure count and triggers blacklist if threshold reached.
+// Returns: (current failures, blacklisted, blacklist until time)
+func (s *sharedMemberState) recordFailure(cause error, threshold int, duration time.Duration) (int, bool, time.Time) {
+	s.mu.Lock()
+	triggered := s.halfOpen
+	s.halfOpen = false
+	if triggered {
+		s.failures = 0
+	} else {
+		s.failures++
+	}
+	count := s.failures
+	var until time.Time
+	if triggered || s.failures >= threshold {
+		triggered = true
+		until = time.Now().Add(duration)
+		s.failures = 0
+		s.blacklisted = true
+		s.blacklistedUntil = until
+	}
+	s.mu.Unlock()
+
+	if entry := s.entry.Load(); entry != nil {
+		entry.RecordFailure(cause)
+		if triggered {
+			entry.Blacklist(until)
+		}
+	}
+	return count, triggered, until
+}
+
+func (s *sharedMemberState) recordSuccess() {
+	s.mu.Lock()
+	wasBlacklisted := s.blacklisted || s.halfOpen
+	s.failures = 0
+	s.blacklisted = false
+	s.blacklistedUntil = time.Time{}
+	s.halfOpen = false
+	s.mu.Unlock()
+
+	if entry := s.entry.Load(); entry != nil {
+		entry.RecordSuccess()
+		if wasBlacklisted {
+			entry.ClearBlacklist()
+		}
+	}
+}
+
+func (s *sharedMemberState) isBlacklisted(now time.Time) bool {
+	s.mu.Lock()
+	blacklisted := s.blacklisted
+	s.mu.Unlock()
+	return blacklisted
+}
+
+func (s *sharedMemberState) tryAcquire(now time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.blacklisted {
+		return true
+	}
+	if now.Before(s.blacklistedUntil) || s.halfOpen {
+		return false
+	}
+	s.halfOpen = true
+	return true
+}
+
+func (s *sharedMemberState) isHalfOpen() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.halfOpen
+}
+
+func (s *sharedMemberState) forceRelease() {
+	s.mu.Lock()
+	s.failures = 0
+	s.blacklisted = false
+	s.blacklistedUntil = time.Time{}
+	s.halfOpen = false
+	s.mu.Unlock()
+
+	if entry := s.entry.Load(); entry != nil {
+		entry.ClearBlacklist()
+	}
+}
+
+func (s *sharedMemberState) incActive() {
+	s.active.Add(1)
+	if entry := s.entry.Load(); entry != nil {
+		entry.IncActive()
+	}
+}
+
+func (s *sharedMemberState) decActive() {
+	s.active.Add(-1)
+	if entry := s.entry.Load(); entry != nil {
+		entry.DecActive()
+	}
+}
+
+func (s *sharedMemberState) activeCount() int32 {
+	return s.active.Load()
+}
+
+// releaseSharedMember clears blacklist state for a tag (called from release functions).
+func releaseSharedMember(tag string) {
+	if state, ok := lookupSharedState(tag); ok {
+		state.forceRelease()
+	}
+}
+
+// blacklistSharedMember manually blacklists a node in pool shared state.
+func blacklistSharedMember(tag string, duration time.Duration) {
+	if state, ok := lookupSharedState(tag); ok {
+		until := time.Now().Add(duration)
+		state.mu.Lock()
+		state.blacklisted = true
+		state.blacklistedUntil = until
+		state.halfOpen = false
+		state.failures = 0
+		state.mu.Unlock()
+	}
+}

@@ -1,0 +1,679 @@
+package importer
+
+import (
+	"encoding/json"
+	"fmt"
+	"sort"
+	"sync"
+	"time"
+)
+
+const (
+	storeVersion    = 1
+	maxStoredJobs   = 100
+	storedJobMaxAge = 7 * 24 * time.Hour
+)
+
+type StoreSnapshot struct {
+	Version int                    `json:"version"`
+	Nodes   map[string]ManagedNode `json:"nodes"`
+}
+
+type storeFile struct {
+	Version int                    `json:"version"`
+	Nodes   map[string]ManagedNode `json:"nodes"`
+	Jobs    map[string]ImportJob   `json:"jobs"`
+}
+
+type Store struct {
+	mu         sync.RWMutex
+	mutationMu sync.Mutex
+	db         *stateDB
+	nodes      map[string]ManagedNode
+	jobs       map[string]ImportJob
+}
+
+func NewStore(path string) (*Store, error) {
+	db, err := openStateDB(path)
+	if err != nil {
+		return nil, fmt.Errorf("open state database: %w", err)
+	}
+	s := &Store{
+		db:    db,
+		nodes: make(map[string]ManagedNode),
+		jobs:  make(map[string]ImportJob),
+	}
+	if err := s.Load(); err != nil {
+		_ = db.close()
+		return nil, fmt.Errorf("load store: %w", err)
+	}
+	if err := s.recoverAndPruneJobs(time.Now()); err != nil {
+		_ = db.close()
+		return nil, fmt.Errorf("recover jobs: %w", err)
+	}
+	return s, nil
+}
+
+func (s *Store) Load() error {
+	nodes, jobs, err := s.db.load()
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.nodes = nodes
+	s.jobs = jobs
+	return nil
+}
+
+func (s *Store) Close() error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	return s.db.close()
+}
+
+func (s *Store) snapshotLocked() storeFile {
+	nodes := make(map[string]ManagedNode, len(s.nodes))
+	for k, v := range s.nodes {
+		nodes[k] = v
+	}
+	jobs := make(map[string]ImportJob, len(s.jobs))
+	for k, v := range s.jobs {
+		jobs[k] = compactPersistedJob(v)
+	}
+	return storeFile{
+		Version: storeVersion,
+		Nodes:   nodes,
+		Jobs:    jobs,
+	}
+}
+
+func compactPersistedJob(job ImportJob) ImportJob {
+	switch job.Status {
+	case ImportStatusCompleted, ImportStatusFailed, ImportStatusCanceled:
+		job.NodeIDs = nil
+	}
+	return job
+}
+
+func (s *Store) recoverAndPruneJobs(now time.Time) error {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+
+	s.mu.Lock()
+	previous := make(map[string]ImportJob, len(s.jobs))
+	for id, job := range s.jobs {
+		previous[id] = job
+	}
+	changed := false
+	changedJobs := make(map[string]ImportJob)
+	deletedJobs := make(map[string]struct{})
+	type retainedJob struct {
+		id     string
+		at     time.Time
+		parsed bool
+	}
+	retained := make([]retainedJob, 0, len(s.jobs))
+	for id, job := range s.jobs {
+		if job.Status == ImportStatusRunning {
+			job.Status = ImportStatusCanceled
+			job.Error = "程序重启，任务已中断"
+			job.ProbePending = 0
+			job.UpdatedAt = now
+			s.jobs[id] = job
+			changedJobs[id] = job
+			changed = true
+		}
+		at := job.UpdatedAt
+		if at.IsZero() {
+			at = job.CreatedAt
+		}
+		if !at.IsZero() && now.After(at) && now.Sub(at) > storedJobMaxAge {
+			delete(s.jobs, id)
+			delete(changedJobs, id)
+			deletedJobs[id] = struct{}{}
+			changed = true
+			continue
+		}
+		retained = append(retained, retainedJob{id: id, at: at, parsed: job.Status == ImportStatusParsed})
+	}
+	sort.Slice(retained, func(i, j int) bool {
+		if retained[i].parsed != retained[j].parsed {
+			return retained[i].parsed
+		}
+		if retained[i].at.Equal(retained[j].at) {
+			return retained[i].id < retained[j].id
+		}
+		return retained[i].at.After(retained[j].at)
+	})
+	if len(retained) > maxStoredJobs {
+		for _, item := range retained[maxStoredJobs:] {
+			delete(s.jobs, item.id)
+			delete(changedJobs, item.id)
+			deletedJobs[item.id] = struct{}{}
+			changed = true
+		}
+	}
+	if !changed {
+		s.mu.Unlock()
+		return nil
+	}
+	s.mu.Unlock()
+	upserts := make([]ImportJob, 0, len(changedJobs))
+	for _, job := range changedJobs {
+		upserts = append(upserts, job)
+	}
+	deletes := make([]string, 0, len(deletedJobs))
+	for id := range deletedJobs {
+		deletes = append(deletes, id)
+	}
+	if err := s.db.applyJobs(upserts, deletes); err != nil {
+		s.mu.Lock()
+		s.jobs = previous
+		s.mu.Unlock()
+		return err
+	}
+	return nil
+}
+
+func (s *Store) saveSnapshot(sf storeFile) error { return s.db.replace(sf.Nodes, sf.Jobs) }
+
+func (s *Store) UpsertNode(node ManagedNode) error {
+	return s.UpsertNodes([]ManagedNode{node})
+}
+
+func (s *Store) UpsertNodes(nodes []ManagedNode) error {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+	s.mu.Lock()
+	now := time.Now()
+	previous := make(map[string]ManagedNode, len(nodes))
+	existed := make(map[string]bool, len(nodes))
+	for i := range nodes {
+		previous[nodes[i].ID], existed[nodes[i].ID] = s.nodes[nodes[i].ID]
+		if existed[nodes[i].ID] {
+			nodes[i] = mergeNodeSourceRefs(previous[nodes[i].ID], nodes[i])
+		} else {
+			nodes[i].SourceRefs = nodeSourceRefs(nodes[i])
+		}
+		if nodes[i].CreatedAt.IsZero() {
+			nodes[i].CreatedAt = now
+		}
+		nodes[i].UpdatedAt = now
+		s.nodes[nodes[i].ID] = nodes[i]
+	}
+	s.mu.Unlock()
+	if err := s.db.upsertNodes(nodes); err != nil {
+		s.mu.Lock()
+		for id, node := range previous {
+			if existed[id] {
+				s.nodes[id] = node
+			} else {
+				delete(s.nodes, id)
+			}
+		}
+		s.mu.Unlock()
+		return err
+	}
+	return nil
+}
+
+func (s *Store) ApplyNodeChanges(nodes []ManagedNode, deleted []string) error {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+	s.mu.Lock()
+	previous := make(map[string]ManagedNode, len(nodes)+len(deleted))
+	existed := make(map[string]bool, len(nodes)+len(deleted))
+	now := time.Now()
+	for i := range nodes {
+		previous[nodes[i].ID], existed[nodes[i].ID] = s.nodes[nodes[i].ID]
+		nodes[i].SourceRefs = deduplicateSourceRefs(nodes[i].SourceRefs)
+		if len(nodes[i].SourceRefs) == 0 {
+			nodes[i].SourceRefs = nodeSourceRefs(nodes[i])
+		}
+		if nodes[i].CreatedAt.IsZero() {
+			nodes[i].CreatedAt = now
+		}
+		nodes[i].UpdatedAt = now
+		s.nodes[nodes[i].ID] = nodes[i]
+	}
+	for _, id := range deleted {
+		if _, recorded := previous[id]; !recorded {
+			previous[id], existed[id] = s.nodes[id]
+		}
+		delete(s.nodes, id)
+	}
+	s.mu.Unlock()
+	if err := s.db.applyNodes(nodes, deleted); err != nil {
+		s.mu.Lock()
+		for id, node := range previous {
+			if existed[id] {
+				s.nodes[id] = node
+			} else {
+				delete(s.nodes, id)
+			}
+		}
+		s.mu.Unlock()
+		return err
+	}
+	return nil
+}
+
+func (s *Store) RestoreNodeStatesIfCurrent(states map[string]ManagedNodeState, current ManagedNodeState) error {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+	s.mu.Lock()
+	now := time.Now()
+	changed := false
+	updated := make([]ManagedNode, 0, len(states))
+	previous := make(map[string]ManagedNode, len(states))
+	for id, state := range states {
+		node, ok := s.nodes[id]
+		if !ok || node.State != current {
+			continue
+		}
+		previous[id] = node
+		node.State = state
+		node.UpdatedAt = now
+		s.nodes[id] = node
+		updated = append(updated, node)
+		changed = true
+	}
+	if !changed {
+		s.mu.Unlock()
+		return nil
+	}
+	s.mu.Unlock()
+	if err := s.db.upsertNodes(updated); err != nil {
+		s.mu.Lock()
+		for id, node := range previous {
+			s.nodes[id] = node
+		}
+		s.mu.Unlock()
+		return err
+	}
+	return nil
+}
+
+func (s *Store) RecoverStaleTestingNodes() (int, error) {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+	s.mu.Lock()
+	now := time.Now()
+	recovered := 0
+	updated := make([]ManagedNode, 0)
+	previous := make(map[string]ManagedNode)
+	for id, node := range s.nodes {
+		if node.State != StateTesting {
+			continue
+		}
+		previous[id] = node
+		switch {
+		case node.InPool:
+			node.State = StateInPool
+		case !node.Enabled:
+			node.State = StateExcluded
+		case node.LastTestAt.IsZero():
+			node.State = StateParsed
+		case node.LastError != "":
+			node.State = StateFailed
+		default:
+			node.State = StatePassed
+		}
+		node.UpdatedAt = now
+		s.nodes[id] = node
+		updated = append(updated, node)
+		recovered++
+	}
+	if recovered == 0 {
+		s.mu.Unlock()
+		return 0, nil
+	}
+	s.mu.Unlock()
+	if err := s.db.upsertNodes(updated); err != nil {
+		s.mu.Lock()
+		for id, node := range previous {
+			s.nodes[id] = node
+		}
+		s.mu.Unlock()
+		return 0, err
+	}
+	return recovered, nil
+}
+
+func (s *Store) GetNode(id string) (ManagedNode, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	n, ok := s.nodes[id]
+	return n, ok
+}
+
+func (s *Store) ListNodes() []ManagedNode {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	result := make([]ManagedNode, 0, len(s.nodes))
+	for _, n := range s.nodes {
+		result = append(result, n)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Order == result[j].Order {
+			return result[i].ID < result[j].ID
+		}
+		return result[i].Order < result[j].Order
+	})
+	return result
+}
+
+func (s *Store) BackupSnapshot() StoreSnapshot {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	nodes := make(map[string]ManagedNode, len(s.nodes))
+	for id, node := range s.nodes {
+		nodes[id] = node
+	}
+	return StoreSnapshot{Version: storeVersion, Nodes: nodes}
+}
+
+func (s *Store) uiSummary() (UISummary, error) {
+	return s.db.uiSummary()
+}
+
+func (s *Store) queryUINodes(query UINodeListQuery) ([]ManagedNode, int, []string, []string, error) {
+	return s.db.queryUINodes(query)
+}
+
+func (s *Store) RestoreNodesSnapshot(snapshot StoreSnapshot) error {
+	if snapshot.Version != storeVersion {
+		return fmt.Errorf("unsupported managed nodes version %d", snapshot.Version)
+	}
+	nodes := make(map[string]ManagedNode, len(snapshot.Nodes))
+	for id, node := range snapshot.Nodes {
+		nodes[id] = node
+	}
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+	s.mu.Lock()
+	previous := s.nodes
+	s.nodes = nodes
+	fileSnapshot := s.snapshotLocked()
+	s.mu.Unlock()
+	if err := s.saveSnapshot(fileSnapshot); err != nil {
+		s.mu.Lock()
+		s.nodes = previous
+		s.mu.Unlock()
+		return err
+	}
+	return nil
+}
+
+func DecodeStoreSnapshot(data []byte) (StoreSnapshot, error) {
+	var snapshot StoreSnapshot
+	if err := json.Unmarshal(data, &snapshot); err != nil {
+		return StoreSnapshot{}, fmt.Errorf("decode managed nodes: %w", err)
+	}
+	if snapshot.Version != storeVersion {
+		return StoreSnapshot{}, fmt.Errorf("unsupported managed nodes version %d", snapshot.Version)
+	}
+	if snapshot.Nodes == nil {
+		snapshot.Nodes = make(map[string]ManagedNode)
+	}
+	for id, node := range snapshot.Nodes {
+		if id == "" || node.ID == "" || id != node.ID || node.URI == "" {
+			return StoreSnapshot{}, fmt.Errorf("invalid managed node %q", id)
+		}
+	}
+	return snapshot, nil
+}
+
+func (s *Store) ReplaceSnapshot(snapshot StoreSnapshot) error {
+	if snapshot.Version != storeVersion {
+		return fmt.Errorf("unsupported managed nodes version %d", snapshot.Version)
+	}
+	nodes := make(map[string]ManagedNode, len(snapshot.Nodes))
+	for id, node := range snapshot.Nodes {
+		nodes[id] = node
+	}
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+	s.mu.Lock()
+	previousNodes := s.nodes
+	previousJobs := s.jobs
+	s.nodes = nodes
+	s.jobs = make(map[string]ImportJob)
+	s.mu.Unlock()
+	if err := s.db.replace(nodes, map[string]ImportJob{}); err != nil {
+		s.mu.Lock()
+		s.nodes = previousNodes
+		s.jobs = previousJobs
+		s.mu.Unlock()
+		return err
+	}
+	return nil
+}
+
+func (s *Store) ListPoolNodes() []ManagedNode {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var result []ManagedNode
+	for _, n := range s.nodes {
+		if n.InPool && n.State == StateInPool {
+			result = append(result, n)
+		}
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Order < result[j].Order })
+	return result
+}
+
+func (s *Store) ListFailedNodes() []ManagedNode {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var result []ManagedNode
+	for _, n := range s.nodes {
+		if n.State == StateFailed {
+			result = append(result, n)
+		}
+	}
+	return result
+}
+
+func (s *Store) UpdateNodeState(id string, state ManagedNodeState, lastErr string) (ManagedNode, error) {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+	s.mu.Lock()
+	n, ok := s.nodes[id]
+	if !ok {
+		s.mu.Unlock()
+		return ManagedNode{}, fmt.Errorf("node %s not found", id)
+	}
+	previous := n
+	n.State = state
+	n.LastError = lastErr
+	n.LastTestAt = time.Now()
+	n.UpdatedAt = time.Now()
+	s.nodes[id] = n
+	s.mu.Unlock()
+	if err := s.db.upsertNodes([]ManagedNode{n}); err != nil {
+		s.mu.Lock()
+		s.nodes[id] = previous
+		s.mu.Unlock()
+		return ManagedNode{}, err
+	}
+	return n, nil
+}
+
+func (s *Store) MarkInPool(id string, port uint16) (ManagedNode, error) {
+	nodes, err := s.MarkInPoolMany(map[string]uint16{id: port})
+	if err != nil {
+		return ManagedNode{}, err
+	}
+	if len(nodes) == 0 {
+		return ManagedNode{}, fmt.Errorf("node %s not found", id)
+	}
+	return nodes[0], nil
+}
+
+func (s *Store) MarkInPoolMany(ports map[string]uint16) ([]ManagedNode, error) {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+	s.mu.Lock()
+	now := time.Now()
+	maxOrder := -1
+	for _, existing := range s.nodes {
+		if existing.InPool && existing.State == StateInPool && existing.Order > maxOrder {
+			maxOrder = existing.Order
+		}
+	}
+
+	updated := make([]ManagedNode, 0, len(ports))
+	previous := make(map[string]ManagedNode, len(ports))
+	for id, port := range ports {
+		n, ok := s.nodes[id]
+		if !ok {
+			continue
+		}
+		previous[id] = n
+		wasInPool := n.InPool && n.State == StateInPool
+		n.State = StateInPool
+		n.InPool = true
+		n.Enabled = true
+		n.Port = port
+		if !wasInPool {
+			maxOrder++
+			n.Order = maxOrder
+		}
+		n.UpdatedAt = now
+		s.nodes[id] = n
+		updated = append(updated, n)
+	}
+	if len(updated) == 0 {
+		s.mu.Unlock()
+		return nil, nil
+	}
+	s.mu.Unlock()
+	if err := s.db.upsertNodes(updated); err != nil {
+		s.mu.Lock()
+		for id, node := range previous {
+			s.nodes[id] = node
+		}
+		s.mu.Unlock()
+		return nil, err
+	}
+	return updated, nil
+}
+
+func (s *Store) SetOrder(ids []string) error {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+	s.mu.Lock()
+	previous := make(map[string]ManagedNode, len(ids))
+	updated := make([]ManagedNode, 0, len(ids))
+	for order, id := range ids {
+		if n, ok := s.nodes[id]; ok {
+			previous[id] = n
+			n.Order = order
+			n.UpdatedAt = time.Now()
+			s.nodes[id] = n
+			updated = append(updated, n)
+		}
+	}
+	s.mu.Unlock()
+	if err := s.db.upsertNodes(updated); err != nil {
+		s.mu.Lock()
+		for id, node := range previous {
+			s.nodes[id] = node
+		}
+		s.mu.Unlock()
+		return err
+	}
+	return nil
+}
+
+func (s *Store) UpsertJob(job ImportJob) error {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+	s.mu.Lock()
+	previous, existed := s.jobs[job.ID]
+	s.jobs[job.ID] = job
+	s.mu.Unlock()
+	if err := s.db.upsertJobs([]ImportJob{job}); err != nil {
+		s.mu.Lock()
+		if existed {
+			s.jobs[job.ID] = previous
+		} else {
+			delete(s.jobs, job.ID)
+		}
+		s.mu.Unlock()
+		return err
+	}
+	return nil
+}
+
+func (s *Store) GetJob(id string) (ImportJob, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	j, ok := s.jobs[id]
+	return j, ok
+}
+
+func (s *Store) UpdateJob(id string, fn func(*ImportJob)) error {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+	s.mu.Lock()
+	j, ok := s.jobs[id]
+	if !ok {
+		s.mu.Unlock()
+		return fmt.Errorf("job %s not found", id)
+	}
+	previous := j
+	fn(&j)
+	s.jobs[id] = j
+	s.mu.Unlock()
+	if err := s.db.upsertJobs([]ImportJob{j}); err != nil {
+		s.mu.Lock()
+		s.jobs[id] = previous
+		s.mu.Unlock()
+		return err
+	}
+	return nil
+}
+
+func (s *Store) UpdateJobProgress(id string, fn func(*ImportJob)) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	j, ok := s.jobs[id]
+	if !ok {
+		return fmt.Errorf("job %s not found", id)
+	}
+	fn(&j)
+	s.jobs[id] = j
+	return nil
+}
+
+func (s *Store) DeleteNode(id string) error {
+	return s.DeleteNodes([]string{id})
+}
+
+func (s *Store) DeleteNodes(ids []string) error {
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+	s.mu.Lock()
+	previous := make(map[string]ManagedNode, len(ids))
+	existed := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		previous[id], existed[id] = s.nodes[id]
+		delete(s.nodes, id)
+	}
+	s.mu.Unlock()
+	if err := s.db.deleteNodes(ids); err != nil {
+		s.mu.Lock()
+		for id, node := range previous {
+			if existed[id] {
+				s.nodes[id] = node
+			}
+		}
+		s.mu.Unlock()
+		return err
+	}
+	return nil
+}
