@@ -136,8 +136,8 @@ class OutlookController:
         info = {'country': '??', 'timezone': 'UTC', 'loc': None}
         try:
             import requests
-            r = requests.get('https://ipinfo.io/json', proxies={'https': proxy_url},
-                             timeout=3, headers={'Accept': 'application/json'})
+            r = requests.get('https://ipinfo.io/json', proxies={'http': proxy_url, 'https': proxy_url},
+                             timeout=6, headers={'Accept': 'application/json'})
             if r.status_code == 200:
                 d = r.json()
                 info = {
@@ -444,6 +444,21 @@ class OutlookController:
             proxy_url = f"{cfg['type']}://{cfg['host']}:{port}"
         else:
             proxy_url = ""
+
+        # Dynamic session injection for rotating proxies (BrightData / superproxy.io)
+        if ('superproxy.io' in proxy_url or 'brightdata' in proxy_url) and '-session-' not in proxy_url:
+            import uuid
+            session_id = uuid.uuid4().hex[:8]
+            try:
+                from urllib.parse import urlparse, urlunparse
+                p = urlparse(proxy_url)
+                if p.username:
+                    new_user = f"{p.username}-session-{session_id}"
+                    new_netloc = f"{new_user}:{p.password}@{p.hostname}:{p.port}" if p.password else f"{new_user}@{p.hostname}:{p.port}"
+                    proxy_url = urlunparse((p.scheme, new_netloc, p.path, p.params, p.query, p.fragment))
+            except Exception:
+                pass
+
         self.thread_local._proxy = proxy_url
         return proxy_url
 

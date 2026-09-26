@@ -101,6 +101,14 @@ document.addEventListener("DOMContentLoaded", () => {
   if (document.getElementById("input-backend-url")) {
     document.getElementById("input-backend-url").value = state.backendUrl;
   }
+
+  if (inputAutoregProxy) {
+    const savedProxy = localStorage.getItem("outlook_autoreg_proxy");
+    inputAutoregProxy.value = savedProxy !== null ? savedProxy : "http://brd-customer-hl_1ceea2e8-zone-isp_proxy1-country-us:luqsn3m3ioyc@brd.superproxy.io:44445";
+    inputAutoregProxy.addEventListener("input", () => {
+      localStorage.setItem("outlook_autoreg_proxy", inputAutoregProxy.value.trim());
+    });
+  }
 });
 
 function updateLucide() {
