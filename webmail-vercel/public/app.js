@@ -103,8 +103,24 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   if (inputAutoregProxy) {
+    const DEFAULT_PROXIES = `31.59.20.176:6754:nxyksszk:o7gfvwwz3cqr
+45.38.107.97:6014:nxyksszk:o7gfvwwz3cqr
+64.137.96.74:6641:nxyksszk:o7gfvwwz3cqr
+198.23.243.226:6361:nxyksszk:o7gfvwwz3cqr
+38.154.185.97:6370:nxyksszk:o7gfvwwz3cqr
+84.247.60.125:6095:nxyksszk:o7gfvwwz3cqr
+142.111.67.146:5611:nxyksszk:o7gfvwwz3cqr
+191.96.254.138:6185:nxyksszk:o7gfvwwz3cqr
+31.58.9.4:6077:nxyksszk:o7gfvwwz3cqr
+198.46.161.42:5092:nxyksszk:o7gfvwwz3cqr`;
+
     const savedProxy = localStorage.getItem("outlook_autoreg_proxy");
-    inputAutoregProxy.value = savedProxy !== null ? savedProxy : "http://brd-customer-hl_1ceea2e8-zone-isp_proxy1-country-us:luqsn3m3ioyc@brd.superproxy.io:44445";
+    if (!savedProxy || savedProxy.includes("superproxy.io")) {
+      inputAutoregProxy.value = DEFAULT_PROXIES;
+      localStorage.setItem("outlook_autoreg_proxy", DEFAULT_PROXIES);
+    } else {
+      inputAutoregProxy.value = savedProxy;
+    }
     inputAutoregProxy.addEventListener("input", () => {
       localStorage.setItem("outlook_autoreg_proxy", inputAutoregProxy.value.trim());
     });

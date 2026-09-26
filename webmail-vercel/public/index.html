@@ -292,9 +292,9 @@
             </select>
           </div>
           <div class="form-group" style="grid-column: 1 / -1;">
-            <label>Прокси для авторега (HTTP / SOCKS5) — <span style="color:var(--danger);">обязательно для Render</span>:</label>
-            <input type="text" id="input-autoreg-proxy" placeholder="http://user:pass@host:port или host:port:user:pass">
-            <span style="font-size:11px;color:var(--text-dim);margin-top:2px;display:block;">Microsoft блокирует IP хостингов. Для авторега используйте резидентские/мобильные прокси.</span>
+            <label>Прокси для авторега (HTTP / SOCKS5) — поддерживается 1 или несколько (по одному на строку):</label>
+            <textarea id="input-autoreg-proxy" rows="3" placeholder="31.59.20.176:6754:user:pass&#10;45.38.107.97:6014:user:pass"></textarea>
+            <span style="font-size:11px;color:var(--text-dim);margin-top:2px;display:block;">Microsoft блокирует IP хостингов. Вставьте один или список прокси — система будет автоматически распределять задачи по пулу.</span>
           </div>
         </div>
 

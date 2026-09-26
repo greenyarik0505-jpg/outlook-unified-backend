@@ -396,22 +396,44 @@ class OutlookController:
     # ============================================================
     @classmethod
     def _parse_proxy_config(cls, pc):
-        """解析代理配置：单端口 or 端口池。返回 {type, host, ports, max_per}"""
+        """解析代理配置：单端口 or 端口池 or 列表。返回 {type, host, ports, max_per, mode, proxy_list}"""
         mode = pc.get('mode', 'single')
+        proxy_list = pc.get('proxy_list', [])
+        if mode == 'list' and proxy_list:
+            return {
+                'mode': 'list',
+                'proxy_list': proxy_list,
+                'max_per': pc.get('max_per_proxy', 10),
+                'ports': [],
+                'host': '',
+                'type': 'http',
+            }
         proxy_type = pc.get('type', 'http')
         host = pc.get('host', '127.0.0.1')
         if mode == 'single':
             ports = [pc.get('single_port', 7890)]
         else:
             ports = list(range(pc.get('port_start', 24000), pc.get('port_end', 24064) + 1))
-        return {'type': proxy_type, 'host': host, 'ports': ports, 'max_per': pc.get('max_per_proxy', 20)}
+        return {'mode': mode, 'type': proxy_type, 'host': host, 'ports': ports, 'max_per': pc.get('max_per_proxy', 20)}
 
     def _pick_proxy(self):
         """选择代理端口：两步——①过滤（排除用满的+烂IP）②加权随机（胜率高的优先）"""
         cfg = self._proxy_config
         with self._state_lock:
+            if cfg.get('mode') == 'list' and cfg.get('proxy_list'):
+                plist = cfg['proxy_list']
+                available = [p for p in plist if self._proxy_usage.get(p, 0) < cfg.get('max_per', 10)]
+                if not available:
+                    for p in plist:
+                        self._proxy_usage[p] = 0
+                    available = list(plist)
+                proxy_url = random.choice(available)
+                self._proxy_usage[proxy_url] = self._proxy_usage.get(proxy_url, 0) + 1
+                self.thread_local._proxy = proxy_url
+                return proxy_url
+
             available = []
-            for p in cfg['ports']:
+            for p in cfg.get('ports', []):
                 if self._proxy_usage.get(p, 0) >= cfg['max_per']:
                     continue
                 key = f"{cfg['host']}:{p}"
@@ -425,7 +447,7 @@ class OutlookController:
                     continue
                 available.append(p)
             if not available:
-                available = list(cfg['ports'])
+                available = list(cfg.get('ports', []))
                 for p in available:
                     self._proxy_usage[p] = 0
             weights = []

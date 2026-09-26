@@ -20,15 +20,15 @@ RESULTS_FILE = REGISTER_DIR / "Results" / "oauth2.txt"
 AUTOREG_LOG_FILE = ROOT / "logs" / "autoreg.log"
 
 
-def parse_proxy_string(raw: Optional[str]) -> Optional[dict[str, Any]]:
-    if not raw or not raw.strip():
+def parse_single_proxy(line: str) -> Optional[dict[str, Any]]:
+    line = line.strip()
+    if not line:
         return None
-    raw = raw.strip()
     scheme = "http"
-    if "://" in raw:
-        scheme, rest = raw.split("://", 1)
+    if "://" in line:
+        scheme, rest = line.split("://", 1)
     else:
-        rest = raw
+        rest = line
 
     username = ""
     password = ""
@@ -66,10 +66,45 @@ def parse_proxy_string(raw: Optional[str]) -> Optional[dict[str, Any]]:
         final_host = f"{username}@{host}"
 
     return {
-        "mode": "single",
         "type": scheme,
         "host": final_host,
-        "single_port": port,
+        "port": port,
+        "full_url": f"{scheme}://{final_host}:{port}",
+    }
+
+
+def parse_proxy_string(raw: Optional[str]) -> Optional[dict[str, Any]]:
+    if not raw or not raw.strip():
+        return None
+    raw = raw.strip()
+    lines = [line.strip() for line in raw.replace(",", "\n").replace(";", "\n").split("\n") if line.strip()]
+    if not lines:
+        return None
+
+    if len(lines) > 1:
+        parsed_list = []
+        for l in lines:
+            p = parse_single_proxy(l)
+            if p:
+                parsed_list.append(p["full_url"])
+        if parsed_list:
+            return {
+                "mode": "list",
+                "proxy_list": parsed_list,
+                "type": "http",
+                "host": "",
+                "single_port": 0,
+                "max_per_proxy": 5,
+            }
+
+    p = parse_single_proxy(lines[0])
+    if not p:
+        return None
+    return {
+        "mode": "single",
+        "type": p["type"],
+        "host": p["host"],
+        "single_port": p["port"],
         "port_start": 0,
         "port_end": 0,
         "max_per_proxy": 20,
@@ -129,7 +164,11 @@ class AutoRegManager:
                 parsed_proxy = parse_proxy_string(proxy)
                 if parsed_proxy:
                     cfg_data["proxy"] = parsed_proxy
-                    self.log_lines.append(f"[{time.strftime('%H:%M:%S')}] [PROXY] Applied proxy: {parsed_proxy['type']}://{parsed_proxy['host'].split('@')[-1]}:{parsed_proxy['single_port']}")
+                    if parsed_proxy.get("mode") == "list":
+                        cnt = len(parsed_proxy.get("proxy_list", []))
+                        self.log_lines.append(f"[{time.strftime('%H:%M:%S')}] [PROXY] Applied proxy pool: {cnt} proxies loaded (multi-proxy mode)")
+                    else:
+                        self.log_lines.append(f"[{time.strftime('%H:%M:%S')}] [PROXY] Applied proxy: {parsed_proxy['type']}://{parsed_proxy['host'].split('@')[-1]}:{parsed_proxy['single_port']}")
                 
                 config_file.write_text(json.dumps(cfg_data, indent=2, ensure_ascii=False), encoding="utf-8")
             except Exception as exc:
