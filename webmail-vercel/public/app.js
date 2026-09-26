@@ -80,11 +80,13 @@ const metricPid = document.getElementById("metric-pid");
 const inputAutoregTasks = document.getElementById("input-autoreg-tasks");
 const inputAutoregConcurrent = document.getElementById("input-autoreg-concurrent");
 const inputAutoregSuffix = document.getElementById("input-autoreg-suffix");
+const inputAutoregProxy = document.getElementById("input-autoreg-proxy");
 const btnStartAutoreg = document.getElementById("btn-start-autoreg");
 const btnStopAutoreg = document.getElementById("btn-stop-autoreg");
 const btnSyncDbNow = document.getElementById("btn-sync-db-now");
 const terminalBody = document.getElementById("terminal-body");
 const checkAutoscroll = document.getElementById("check-autoscroll");
+const btnCopyTerminal = document.getElementById("btn-copy-terminal");
 const btnClearTerminal = document.getElementById("btn-clear-terminal");
 const autoregActionStatus = document.getElementById("autoreg-action-status");
 
@@ -161,7 +163,7 @@ function handleAuthUser(user) {
   } else {
     // Access DENIED
     auth.signOut();
-    showAuthError(`⛔ Доступ запрещен! Ваш email (${user.email}) не в белом списке. Доступ разрешен исключительно для ${WHITELIST_EMAIL}.`);
+    showAuthError(`⛔ Доступ запрещен. Аккаунт ${user.email} не авторизован.`);
   }
 }
 
@@ -192,6 +194,7 @@ async function startAutoreg() {
   const tasks = parseInt(inputAutoregTasks.value, 10) || 5;
   const concurrent = parseInt(inputAutoregConcurrent.value, 10) || 1;
   const suffix = inputAutoregSuffix.value || "@outlook.com";
+  const proxy = inputAutoregProxy ? inputAutoregProxy.value.trim() : "";
 
   btnStartAutoreg.disabled = true;
   autoregActionStatus.innerText = "Запуск воркера...";
@@ -206,6 +209,7 @@ async function startAutoreg() {
         concurrent: concurrent,
         email_suffix: suffix,
         headless: true,
+        proxy: proxy || null,
       }),
     });
     const data = await resp.json();
@@ -626,6 +630,17 @@ function setupEventListeners() {
   btnClearTerminal.addEventListener("click", () => {
     terminalBody.innerHTML = `<div class="terminal-line info">[SYS] Terminal cleared.</div>`;
   });
+  if (btnCopyTerminal) {
+    btnCopyTerminal.addEventListener("click", () => {
+      const lineEls = Array.from(terminalBody.querySelectorAll(".terminal-line"));
+      if (!lineEls || lineEls.length === 0) {
+        showToast("Логи пусты", "error");
+        return;
+      }
+      const text = lineEls.map((el) => el.innerText).join("\n");
+      copyToClipboard(text, "Все логи скопированы в буфер!");
+    });
+  }
 
   // Mail folder tabs
   document.querySelectorAll(".nav-folders .nav-item").forEach((item) => {

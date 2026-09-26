@@ -440,7 +440,10 @@ class OutlookController:
                 weights.append(max(0.01, weight))
             port = random.choices(available, weights=weights, k=1)[0]
             self._proxy_usage[port] = self._proxy_usage.get(port, 0) + 1
-        proxy_url = f"{cfg['type']}://{cfg['host']}:{port}"
+        if cfg.get('host') and port:
+            proxy_url = f"{cfg['type']}://{cfg['host']}:{port}"
+        else:
+            proxy_url = ""
         self.thread_local._proxy = proxy_url
         return proxy_url
 
@@ -562,11 +565,29 @@ class OutlookController:
                 f'--timezone={tz}',
             ]
 
+            proxy_spec = None
+            if proxy_url and not proxy_url.endswith("://:0") and not proxy_url.endswith("://:"):
+                proxy_spec = {"server": proxy_url, "bypass": "localhost"}
+                if "@" in proxy_url:
+                    try:
+                        from urllib.parse import urlparse
+                        parsed = urlparse(proxy_url)
+                        proxy_spec = {
+                            "server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}",
+                            "username": parsed.username or "",
+                            "password": parsed.password or "",
+                            "bypass": "localhost",
+                        }
+                    except Exception:
+                        pass
+            self.thread_local._proxy_spec = proxy_spec
+
             common = {
                 'headless': self.headless,
                 'args': args,
-                'proxy': {"server": proxy_url, "bypass": "localhost"},
             }
+            if proxy_spec:
+                common['proxy'] = proxy_spec
 
             exe = self.browser_executable_path
             profile_dir = None
@@ -683,6 +704,9 @@ class OutlookController:
                 context_opts['geolocation'] = {'latitude': float(lat), 'longitude': float(lng)}
             except Exception:
                 pass
+        proxy_spec = getattr(self.thread_local, '_proxy_spec', None)
+        if proxy_spec:
+            context_opts['proxy'] = proxy_spec
         context = None
         try:
             context = browser.new_context(**context_opts)

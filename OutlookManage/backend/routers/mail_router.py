@@ -270,6 +270,7 @@ class StartAutoregRequest(BaseModel):
     tasks: Optional[int] = 5
     email_suffix: Optional[str] = "@outlook.com"
     headless: Optional[bool] = True
+    proxy: Optional[str] = None
 
 
 # AutoReg router endpoints
@@ -282,6 +283,7 @@ def start_autoreg(req: Optional[StartAutoregRequest] = None):
         tasks=r.tasks or 5,
         email_suffix=r.email_suffix or "@outlook.com",
         headless=r.headless if r.headless is not None else True,
+        proxy=r.proxy,
     )
 
 

@@ -20,6 +20,62 @@ RESULTS_FILE = REGISTER_DIR / "Results" / "oauth2.txt"
 AUTOREG_LOG_FILE = ROOT / "logs" / "autoreg.log"
 
 
+def parse_proxy_string(raw: Optional[str]) -> Optional[dict[str, Any]]:
+    if not raw or not raw.strip():
+        return None
+    raw = raw.strip()
+    scheme = "http"
+    if "://" in raw:
+        scheme, rest = raw.split("://", 1)
+    else:
+        rest = raw
+
+    username = ""
+    password = ""
+    host = ""
+    port = 8080
+
+    if "@" in rest:
+        auth_part, host_part = rest.split("@", 1)
+        if ":" in auth_part:
+            username, password = auth_part.split(":", 1)
+        else:
+            username = auth_part
+        if ":" in host_part:
+            host, port_str = host_part.split(":", 1)
+            port = int(port_str.split("/")[0])
+        else:
+            host = host_part
+    elif rest.count(":") == 3:
+        parts = rest.split(":")
+        host = parts[0]
+        port = int(parts[1])
+        username = parts[2]
+        password = parts[3]
+    elif ":" in rest:
+        host, port_str = rest.split(":", 1)
+        port = int(port_str.split("/")[0])
+    else:
+        host = rest
+        port = 8080
+
+    final_host = host
+    if username and password:
+        final_host = f"{username}:{password}@{host}"
+    elif username:
+        final_host = f"{username}@{host}"
+
+    return {
+        "mode": "single",
+        "type": scheme,
+        "host": final_host,
+        "single_port": port,
+        "port_start": 0,
+        "port_end": 0,
+        "max_per_proxy": 20,
+    }
+
+
 class AutoRegManager:
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -42,6 +98,7 @@ class AutoRegManager:
         tasks: int = 5,
         email_suffix: str = "@outlook.com",
         headless: bool = True,
+        proxy: Optional[str] = None,
     ) -> dict[str, Any]:
         with self._lock:
             if self._is_running and self._process and self._process.poll() is None:
@@ -68,6 +125,12 @@ class AutoRegManager:
                 cfg_data["concurrent_flows"] = max(1, int(concurrent or 1))
                 cfg_data["email_suffix"] = email_suffix if email_suffix else "@outlook.com"
                 cfg_data["headless"] = bool(headless)
+                
+                parsed_proxy = parse_proxy_string(proxy)
+                if parsed_proxy:
+                    cfg_data["proxy"] = parsed_proxy
+                    self.log_lines.append(f"[{time.strftime('%H:%M:%S')}] [PROXY] Applied proxy: {parsed_proxy['type']}://{parsed_proxy['host'].split('@')[-1]}:{parsed_proxy['single_port']}")
+                
                 config_file.write_text(json.dumps(cfg_data, indent=2, ensure_ascii=False), encoding="utf-8")
             except Exception as exc:
                 self.log_lines.append(f"[{time.strftime('%H:%M:%S')}] [WARN] Failed to write config.json: {exc}")
