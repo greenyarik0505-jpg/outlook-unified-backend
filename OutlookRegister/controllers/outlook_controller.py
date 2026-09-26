@@ -824,6 +824,7 @@ class OutlookController:
         
         返回: True(注册成功) 或 False(失败)
         """
+        start_time = time.time()
         fake = Faker()
         lastname = fake.last_name()
         firstname = fake.first_name()
@@ -833,13 +834,26 @@ class OutlookController:
 
         for goto_attempt in range(2):
             try:
-                page.goto("https://outlook.live.com/mail/0/?prompt=create_account", timeout=35000, wait_until="domcontentloaded")
-                for selector in ['text=同意并继续', 'text=Accept', 'text=Accept all', 'text=Agree and continue', 'text=Принять', "button:has-text('同意')"]:
+                page.goto("https://signup.live.com/?lic=1", timeout=35000, wait_until="domcontentloaded")
+                consent_selectors = [
+                    '#nextButton',
+                    '[data-testid="primaryButton"]:has-text("同意")',
+                    '[data-testid="primaryButton"]:has-text("Accept")',
+                    '[data-testid="primaryButton"]:has-text("Agree")',
+                    'text=同意并继续',
+                    'text=Accept',
+                    'text=Accept all',
+                    'text=Agree and continue',
+                    'text=Принять',
+                    "button:has-text('同意')"
+                ]
+                for selector in consent_selectors:
                     try:
                         btn = page.locator(selector).first
-                        if btn.is_visible(timeout=2000):
-                            page.wait_for_timeout(0.1 * self.wait_time)
-                            btn.click(timeout=5000)
+                        if btn.is_visible(timeout=1500):
+                            page.wait_for_timeout(0.05 * self.wait_time)
+                            btn.click(timeout=3000)
+                            page.wait_for_timeout(0.05 * self.wait_time)
                             break
                     except Exception:
                         pass
@@ -850,71 +864,101 @@ class OutlookController:
                     continue
                 self.bump_failure('ip_cant_open', 'register_page_open_fail')
                 err_str = str(exc)
-                self._log(f"[Fail:IP] - Ошибка при загрузке Outlook: {err_str[:120]}")
+                self._log(f"[Fail:IP] - Ошибка при загрузке страницы регистрации: {err_str[:120]}")
                 return False
 
         try:
-            # 选择是 outlook还是hotmail
-            if self.email_suffix == "@hotmail.com":
-                page.get_by_text("@outlook.com").click(timeout=10000)
-                page.locator(f'[role="option"]:text-is("@hotmail.com")').click()
+            # 模式A：已处于新建邮箱子步骤 (存在 [aria-label="新建电子邮件"])
+            email_field = page.locator('[aria-label="新建电子邮件"], [aria-label*="新建电子邮件"]').first
+            if email_field.is_visible(timeout=2500):
+                if self.email_suffix == "@hotmail.com":
+                    try:
+                        page.get_by_text("@outlook.com").click(timeout=5000)
+                        page.locator(f'[role="option"]:text-is("@hotmail.com")').click(timeout=3000)
+                    except Exception:
+                        pass
+                email_field.click()
+                email_field.fill(email, timeout=10000)
+                page.locator('[data-testid="primaryButton"], button:has-text("下一步")').first.click(timeout=5000)
+            else:
+                # 模式B：标准入口 input[name="email"], input[type="email"]
+                full_email = f"{email}{self.email_suffix}"
+                gen_input = page.locator('input[name="email"], input[type="email"], [aria-label*="电子邮件"]').first
+                gen_input.wait_for(state="visible", timeout=12000)
+                gen_input.click()
+                gen_input.fill(full_email, timeout=10000)
+                page.wait_for_timeout(0.02 * self.wait_time)
+                page.locator('[data-testid="primaryButton"], button:has-text("下一步")').first.click(timeout=5000)
+                page.wait_for_timeout(0.03 * self.wait_time)
 
-            # 填充邮箱
-            email_input = page.locator('[aria-label="新建电子邮件"]')
-            email_input.click()
-            email_input.fill(email, timeout=10000)
+                # 若要求在新建邮箱输入框二次确认或输入用户名
+                confirm_field = page.locator('[aria-label="新建电子邮件"], [aria-label*="新建电子邮件"]').first
+                if confirm_field.is_visible(timeout=2500):
+                    confirm_field.click()
+                    confirm_field.fill(email, timeout=10000)
+                    page.wait_for_timeout(0.02 * self.wait_time)
+                    page.locator('[data-testid="primaryButton"], button:has-text("下一步")').first.click(timeout=5000)
 
-            # 点击 "下一步
-            page.locator('[data-testid="primaryButton"]').click(timeout=5000)
             page.wait_for_timeout(0.02 * self.wait_time)
 
-            #填充密码
-            page.locator('[type="password"]').type(password, delay=0.004 * self.wait_time, timeout=10000)
+            # 填充密码
+            pwd_field = page.locator('[type="password"]').first
+            pwd_field.wait_for(state="visible", timeout=12000)
+            pwd_field.type(password, delay=0.004 * self.wait_time, timeout=10000)
             page.wait_for_timeout(0.02 * self.wait_time)
             
-            # 点击 "下一步
-            page.locator('[data-testid="primaryButton"]').click(timeout=5000)
+            # 点击 "下一步"
+            page.locator('[data-testid="primaryButton"], button:has-text("下一步")').first.click(timeout=5000)
             page.wait_for_timeout(0.03 * self.wait_time)
 
             # 填充出生的年份
-            page.locator('[name="BirthYear"]').fill(year, timeout=10000)
+            year_field = page.locator('[name="BirthYear"]').first
+            year_field.wait_for(state="visible", timeout=12000)
+            year_field.fill(year, timeout=10000)
 
-            # 填充出生日期,实际上不会走 try，走的是Except。因为 有浮层的存在，
+            # 填充出生日期
             try:
                 # 填充月份
                 page.wait_for_timeout(0.02 * self.wait_time)
-                page.locator('[name="BirthMonth"]').select_option(value=month, timeout=1000)
+                page.locator('[name="BirthMonth"]').first.select_option(value=month, timeout=1500)
 
                 # 填充日期
                 page.wait_for_timeout(0.05 * self.wait_time)
-                page.locator('[name="BirthDay"]').select_option(value=day)
+                page.locator('[name="BirthDay"]').first.select_option(value=day, timeout=1500)
             except Exception:
-
                 # 填充月份
-                page.locator('[name="BirthMonth"]').click()
+                page.locator('[name="BirthMonth"]').first.click()
                 page.wait_for_timeout(0.02 * self.wait_time)
                 page.locator(f'[role="option"]:text-is("{month}月")').click()
                 page.wait_for_timeout(0.04 * self.wait_time)
 
                 # 填充日期
-                page.locator('[name="BirthDay"]').click()
+                page.locator('[name="BirthDay"]').first.click()
                 page.wait_for_timeout(0.03 * self.wait_time)
                 page.locator(f'[role="option"]:text-is("{day}日")').click()
-                page.locator('[data-testid="primaryButton"]').click(timeout=5000)
+                
+            page.locator('[data-testid="primaryButton"], button:has-text("下一步")').first.click(timeout=5000)
+            page.wait_for_timeout(0.03 * self.wait_time)
 
             # 填充姓氏
-            page.locator('#lastNameInput').type(lastname, delay=0.002 * self.wait_time, timeout=10000)
+            last_name_field = page.locator('#lastNameInput').first
+            last_name_field.wait_for(state="visible", timeout=12000)
+            last_name_field.type(lastname, delay=0.002 * self.wait_time, timeout=10000)
             page.wait_for_timeout(0.02 * self.wait_time)
 
             # 填充名字
-            page.locator('#firstNameInput').fill(firstname, timeout=10000)
+            first_name_field = page.locator('#firstNameInput').first
+            first_name_field.fill(firstname, timeout=10000)
 
             if time.time() - start_time < self.wait_time / 1000:
                 page.wait_for_timeout(self.wait_time - (time.time() - start_time) * 1000)
 
-            # 点击 "下一步
-            page.locator('[data-testid="primaryButton"]').click(timeout=5000)
-            page.locator('span > [href="https://go.microsoft.com/fwlink/?LinkID=521839"]').wait_for(state='detached', timeout=22000)
+            # 点击 "下一步"
+            page.locator('[data-testid="primaryButton"], button:has-text("下一步")').first.click(timeout=5000)
+            try:
+                page.locator('span > [href="https://go.microsoft.com/fwlink/?LinkID=521839"]').wait_for(state='detached', timeout=22000)
+            except Exception:
+                page.wait_for_timeout(800)
             page.wait_for_timeout(400)
 
             if page.get_by_text('一些异常活动').count() or page.get_by_text('此站点正在维护，暂时无法使用，请稍后重试。').count() > 0:
@@ -935,7 +979,7 @@ class OutlookController:
             captcha_result = self.handle_captcha(page)
             # 没有通过，报错
             if not captcha_result:
-                raise TimeoutError
+                raise TimeoutError("Captcha verification did not succeed")
 
             # 验证码通过后：跳过辅助邮箱 / 通行密钥拦截，进入邮箱
             if self._enter_mailbox_after_register(page):
@@ -945,9 +989,9 @@ class OutlookController:
                     f'Success:Captcha] - {email}{self.email_suffix} 验证码通过，但未确认进入邮箱（已尝试跳过/直达）。'
                 )
 
-        except Exception:
+        except Exception as e:
             self.bump_failure('captcha_fail', 'register_form_fail')
-            self._log("[Fail:Captcha] - 验证码未通过（已达最大重试次数），请换IP后重新注册")
+            self._log(f"[Fail:Captcha] - Ошибка при заполнении формы/капче ({type(e).__name__}: {str(e)[:100]})")
             return False
 
         # 走到这里说明验证码过了，注册成功
