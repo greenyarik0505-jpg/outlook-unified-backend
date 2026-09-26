@@ -858,7 +858,11 @@ class OutlookController:
 
             try:
                 page.goto("https://signup.live.com/?lic=1", timeout=35000, wait_until="domcontentloaded")
-                page.wait_for_timeout(2500)
+                page.wait_for_timeout(2000)
+                if page.get_by_text('Too Many Requests').count() > 0 or page.locator('text="Too Many Requests"').count() > 0:
+                    self.bump_failure('ip_blocked')
+                    self._log("[Fail:IP] - Превышен лимит запросов с этого IP (HTTP 429 Too Many Requests от Microsoft). Смените IP.")
+                    return False
                 _dismiss_consent_dialog()
                 break
             except Exception as exc:
@@ -872,6 +876,11 @@ class OutlookController:
 
         try:
             self._log("[Step 1/5] - Ожидание формы ввода email...")
+            if page.get_by_text('Too Many Requests').count() > 0:
+                self.bump_failure('ip_blocked')
+                self._log("[Fail:IP] - Превышен лимит запросов с этого IP (HTTP 429 Too Many Requests от Microsoft). Смените IP.")
+                return False
+
             _dismiss_consent_dialog()
 
             # 模式A：已处于新建邮箱子步骤 (存在 [aria-label="新建电子邮件"])
@@ -935,26 +944,32 @@ class OutlookController:
             year_field.wait_for(state="visible", timeout=15000)
             year_field.fill(year, timeout=10000)
 
-            # 填充出生日期
+            # 填充出生日期 (采用无语言依赖的 0-based 索引选取 option)
+            m_idx = max(0, min(11, int(month) - 1))
             try:
-                # 填充月份
-                page.wait_for_timeout(0.02 * self.wait_time)
-                page.locator('[name="BirthMonth"]').first.select_option(value=month, timeout=2000)
-
-                # 填充日期
-                page.wait_for_timeout(0.05 * self.wait_time)
-                page.locator('[name="BirthDay"]').first.select_option(value=day, timeout=2000)
+                month_btn = page.locator('#BirthMonthDropdown, [name="BirthMonth"]').first
+                month_btn.click(timeout=3000)
+                page.wait_for_timeout(300)
+                page.locator('[role="option"]').nth(m_idx).click(timeout=3000)
             except Exception:
-                # 填充月份
-                page.locator('[name="BirthMonth"]').first.click(timeout=3000)
-                page.wait_for_timeout(0.02 * self.wait_time)
-                page.locator(f'[role="option"]:text-is("{month}月")').click(timeout=3000)
-                page.wait_for_timeout(0.04 * self.wait_time)
+                try:
+                    page.locator('[name="BirthMonth"]').first.select_option(value=month, timeout=2000)
+                except Exception:
+                    pass
 
-                # 填充日期
-                page.locator('[name="BirthDay"]').first.click(timeout=3000)
-                page.wait_for_timeout(0.03 * self.wait_time)
-                page.locator(f'[role="option"]:text-is("{day}日")').click(timeout=3000)
+            page.wait_for_timeout(300)
+
+            d_idx = max(0, min(30, int(day) - 1))
+            try:
+                day_btn = page.locator('#BirthDayDropdown, [name="BirthDay"]').first
+                day_btn.click(timeout=3000)
+                page.wait_for_timeout(300)
+                page.locator('[role="option"]').nth(d_idx).click(timeout=3000)
+            except Exception:
+                try:
+                    page.locator('[name="BirthDay"]').first.select_option(value=day, timeout=2000)
+                except Exception:
+                    pass
                 
             page.locator('[data-testid="primaryButton"], button:has-text("下一步")').first.click(timeout=5000)
             page.wait_for_timeout(0.03 * self.wait_time)
@@ -981,9 +996,9 @@ class OutlookController:
                 page.wait_for_timeout(800)
             page.wait_for_timeout(400)
 
-            if page.get_by_text('一些异常活动').count() or page.get_by_text('此站点正在维护，暂时无法使用，请稍后重试。').count() > 0:
+            if page.get_by_text('一些异常活动').count() or page.get_by_text('此站点正在维护，暂时无法使用，请稍后重试。').count() or page.get_by_text('unusual activity').count() > 0:
                 self.bump_failure('ip_blocked')
-                self._log("[Fail:IP] - 当前IP已被微软风控拦截，请更换IP重试")
+                self._log("[Fail:IP] - Текущий IP заблокирован антифродом Microsoft (Unusual activity / 风控拦截)")
                 return False
 
             if page.locator('iframe#enforcementFrame').count() > 0:
