@@ -309,6 +309,12 @@ def get_autoreg_logs(limit: int = 150):
     }
 
 
+@autoreg_router.post("/clear_logs")
+def clear_autoreg_logs():
+    """Clear live logs buffer."""
+    return autoreg_mgr.clear_logs()
+
+
 @autoreg_router.post("/sync")
 def sync_autoreg():
     """Force scan Results/oauth2.txt and sync new accounts to database."""

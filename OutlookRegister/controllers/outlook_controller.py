@@ -811,13 +811,22 @@ class OutlookController:
 
         try:
             page.goto("https://outlook.live.com/mail/0/?prompt=create_account", timeout=30000, wait_until="domcontentloaded")
-            page.get_by_text('同意并继续').wait_for(timeout=30000)
-            start_time = time.time()
-            page.wait_for_timeout(0.1 * self.wait_time)
-            page.get_by_text('同意并继续').click(timeout=30000)
-        except Exception:
+            for selector in ['text=同意并继续', 'text=Accept', 'text=Accept all', 'text=Agree and continue', 'text=Принять', "button:has-text('同意')"]:
+                try:
+                    btn = page.locator(selector).first
+                    if btn.is_visible(timeout=2000):
+                        page.wait_for_timeout(0.1 * self.wait_time)
+                        btn.click(timeout=5000)
+                        break
+                except Exception:
+                    pass
+        except Exception as exc:
             self.bump_failure('ip_cant_open', 'register_page_open_fail')
-            self._log("[Fail:IP] - IP质量不佳，无法打开Outlook注册页面，请换IP重试")
+            err_str = str(exc)
+            if '403' in err_str or 'TUNNEL' in err_str or 'tunnel' in err_str:
+                self._log(f"[Fail:IP] - Прокси отклонил доступ (403 Forbidden / Tunnel Failed). Домен outlook.live.com заблокирован вашим провайдером прокси: {err_str[:120]}")
+            else:
+                self._log(f"[Fail:IP] - Не удалось открыть Outlook ({err_str[:100]}). Проверьте прокси или смените IP.")
             return False
 
         try:

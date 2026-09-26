@@ -306,7 +306,10 @@ async function fetchAutoregLogs() {
 }
 
 function renderTerminalLines(lines) {
-  if (!lines || lines.length === 0) return;
+  if (!lines || lines.length === 0) {
+    terminalBody.innerHTML = `<div class="terminal-line info">[SYS] Terminal ready. Журнал пуст.</div>`;
+    return;
+  }
 
   terminalBody.innerHTML = "";
   lines.forEach((line) => {
@@ -635,8 +638,17 @@ function setupEventListeners() {
   btnStartAutoreg.addEventListener("click", startAutoreg);
   btnStopAutoreg.addEventListener("click", stopAutoreg);
   btnSyncDbNow.addEventListener("click", syncDbNow);
-  btnClearTerminal.addEventListener("click", () => {
-    terminalBody.innerHTML = `<div class="terminal-line info">[SYS] Terminal cleared.</div>`;
+  btnClearTerminal.addEventListener("click", async () => {
+    terminalBody.innerHTML = `<div class="terminal-line info">[SYS] Очистка логов...</div>`;
+    if (state.backendUrl) {
+      try {
+        await fetch(`${state.backendUrl.replace(/\/+$/, "")}/api/autoreg/clear_logs`, { method: "POST" });
+      } catch (e) {
+        // ignore
+      }
+    }
+    terminalBody.innerHTML = `<div class="terminal-line info">[SYS] Terminal ready. Журнал очищен.</div>`;
+    showToast("Логи терминала очищены", "success");
   });
   if (btnCopyTerminal) {
     btnCopyTerminal.addEventListener("click", () => {

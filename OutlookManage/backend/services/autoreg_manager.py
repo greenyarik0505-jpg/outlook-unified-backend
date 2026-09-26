@@ -224,6 +224,12 @@ class AutoRegManager:
         lines = list(self.log_lines)
         return lines[-limit:]
 
+    def clear_logs(self) -> dict[str, Any]:
+        with self._lock:
+            self.log_lines.clear()
+            self.log_lines.append(f"[{time.strftime('%H:%M:%S')}] [SYS] Terminal cleared by user.")
+        return {"success": True}
+
     def _monitor_loop(self) -> None:
         """Read stdout in real-time, buffer lines, and sync results."""
         if not self._process or not self._process.stdout:
