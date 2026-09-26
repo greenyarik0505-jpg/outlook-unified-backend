@@ -833,30 +833,33 @@ class OutlookController:
         day = str(random.randint(1, 25))
 
         for goto_attempt in range(2):
-            try:
-                page.goto("https://signup.live.com/?lic=1", timeout=35000, wait_until="domcontentloaded")
+            def _dismiss_consent_dialog():
                 consent_selectors = [
                     '#nextButton',
                     '[data-testid="primaryButton"]:has-text("同意")',
                     '[data-testid="primaryButton"]:has-text("Accept")',
                     '[data-testid="primaryButton"]:has-text("Agree")',
-                    'text=同意并继续',
-                    'text=Accept',
-                    'text=Accept all',
-                    'text=Agree and continue',
-                    'text=Принять',
-                    "button:has-text('同意')"
+                    'button:has-text("同意并继续")',
+                    'button:has-text("Accept")',
+                    'button:has-text("Agree and continue")',
+                    'button:has-text("Принять")',
+                    'button:has-text("同意")',
                 ]
-                for selector in consent_selectors:
+                for sel in consent_selectors:
                     try:
-                        btn = page.locator(selector).first
-                        if btn.is_visible(timeout=1500):
-                            page.wait_for_timeout(0.05 * self.wait_time)
-                            btn.click(timeout=3000)
-                            page.wait_for_timeout(0.05 * self.wait_time)
-                            break
+                        el = page.locator(sel).first
+                        if el.count() > 0 and el.is_visible():
+                            el.click(timeout=3000)
+                            page.wait_for_timeout(800)
+                            return True
                     except Exception:
                         pass
+                return False
+
+            try:
+                page.goto("https://signup.live.com/?lic=1", timeout=35000, wait_until="domcontentloaded")
+                page.wait_for_timeout(2500)
+                _dismiss_consent_dialog()
                 break
             except Exception as exc:
                 if goto_attempt == 0:
@@ -868,24 +871,35 @@ class OutlookController:
                 return False
 
         try:
+            self._log("[Step 1/5] - Ожидание формы ввода email...")
+            _dismiss_consent_dialog()
+
             # 模式A：已处于新建邮箱子步骤 (存在 [aria-label="新建电子邮件"])
             email_field = page.locator('[aria-label="新建电子邮件"], [aria-label*="新建电子邮件"]').first
-            if email_field.is_visible(timeout=2500):
+            is_substep = False
+            try:
+                if email_field.count() > 0 and email_field.is_visible():
+                    is_substep = True
+            except Exception:
+                pass
+
+            if is_substep:
                 if self.email_suffix == "@hotmail.com":
                     try:
                         page.get_by_text("@outlook.com").click(timeout=5000)
                         page.locator(f'[role="option"]:text-is("@hotmail.com")').click(timeout=3000)
                     except Exception:
                         pass
-                email_field.click()
+                email_field.click(timeout=5000)
                 email_field.fill(email, timeout=10000)
                 page.locator('[data-testid="primaryButton"], button:has-text("下一步")').first.click(timeout=5000)
             else:
                 # 模式B：标准入口 input[name="email"], input[type="email"]
                 full_email = f"{email}{self.email_suffix}"
                 gen_input = page.locator('input[name="email"], input[type="email"], [aria-label*="电子邮件"]').first
-                gen_input.wait_for(state="visible", timeout=12000)
-                gen_input.click()
+                gen_input.wait_for(state="visible", timeout=15000)
+                _dismiss_consent_dialog()
+                gen_input.click(timeout=5000)
                 gen_input.fill(full_email, timeout=10000)
                 page.wait_for_timeout(0.02 * self.wait_time)
                 page.locator('[data-testid="primaryButton"], button:has-text("下一步")').first.click(timeout=5000)
@@ -893,17 +907,21 @@ class OutlookController:
 
                 # 若要求在新建邮箱输入框二次确认或输入用户名
                 confirm_field = page.locator('[aria-label="新建电子邮件"], [aria-label*="新建电子邮件"]').first
-                if confirm_field.is_visible(timeout=2500):
-                    confirm_field.click()
-                    confirm_field.fill(email, timeout=10000)
-                    page.wait_for_timeout(0.02 * self.wait_time)
-                    page.locator('[data-testid="primaryButton"], button:has-text("下一步")').first.click(timeout=5000)
+                try:
+                    if confirm_field.count() > 0 and confirm_field.is_visible():
+                        confirm_field.click(timeout=5000)
+                        confirm_field.fill(email, timeout=10000)
+                        page.wait_for_timeout(0.02 * self.wait_time)
+                        page.locator('[data-testid="primaryButton"], button:has-text("下一步")').first.click(timeout=5000)
+                except Exception:
+                    pass
 
             page.wait_for_timeout(0.02 * self.wait_time)
 
             # 填充密码
+            self._log("[Step 2/5] - Ввод пароля...")
             pwd_field = page.locator('[type="password"]').first
-            pwd_field.wait_for(state="visible", timeout=12000)
+            pwd_field.wait_for(state="visible", timeout=15000)
             pwd_field.type(password, delay=0.004 * self.wait_time, timeout=10000)
             page.wait_for_timeout(0.02 * self.wait_time)
             
@@ -912,37 +930,39 @@ class OutlookController:
             page.wait_for_timeout(0.03 * self.wait_time)
 
             # 填充出生的年份
+            self._log("[Step 3/5] - Ввод даты рождения...")
             year_field = page.locator('[name="BirthYear"]').first
-            year_field.wait_for(state="visible", timeout=12000)
+            year_field.wait_for(state="visible", timeout=15000)
             year_field.fill(year, timeout=10000)
 
             # 填充出生日期
             try:
                 # 填充月份
                 page.wait_for_timeout(0.02 * self.wait_time)
-                page.locator('[name="BirthMonth"]').first.select_option(value=month, timeout=1500)
+                page.locator('[name="BirthMonth"]').first.select_option(value=month, timeout=2000)
 
                 # 填充日期
                 page.wait_for_timeout(0.05 * self.wait_time)
-                page.locator('[name="BirthDay"]').first.select_option(value=day, timeout=1500)
+                page.locator('[name="BirthDay"]').first.select_option(value=day, timeout=2000)
             except Exception:
                 # 填充月份
-                page.locator('[name="BirthMonth"]').first.click()
+                page.locator('[name="BirthMonth"]').first.click(timeout=3000)
                 page.wait_for_timeout(0.02 * self.wait_time)
-                page.locator(f'[role="option"]:text-is("{month}月")').click()
+                page.locator(f'[role="option"]:text-is("{month}月")').click(timeout=3000)
                 page.wait_for_timeout(0.04 * self.wait_time)
 
                 # 填充日期
-                page.locator('[name="BirthDay"]').first.click()
+                page.locator('[name="BirthDay"]').first.click(timeout=3000)
                 page.wait_for_timeout(0.03 * self.wait_time)
-                page.locator(f'[role="option"]:text-is("{day}日")').click()
+                page.locator(f'[role="option"]:text-is("{day}日")').click(timeout=3000)
                 
             page.locator('[data-testid="primaryButton"], button:has-text("下一步")').first.click(timeout=5000)
             page.wait_for_timeout(0.03 * self.wait_time)
 
             # 填充姓氏
+            self._log("[Step 4/5] - Ввод имени...")
             last_name_field = page.locator('#lastNameInput').first
-            last_name_field.wait_for(state="visible", timeout=12000)
+            last_name_field.wait_for(state="visible", timeout=15000)
             last_name_field.type(lastname, delay=0.002 * self.wait_time, timeout=10000)
             page.wait_for_timeout(0.02 * self.wait_time)
 
@@ -971,6 +991,7 @@ class OutlookController:
                 self._log("[Fail:Captcha] - 验证码类型为FunCaptcha而非按压验证码，当前IP暂不支持，请换IP重试")
                 return False
 
+            self._log("[Step 5/5] - Переход к капче...")
             # 策略 2：只自动填表到验证码界面，验证码 + 进邮箱 + OAuth 全部由你手动
             if self.captcha_strategy == 2:
                 return self._hand_off_at_captcha(page, email, password)
@@ -990,8 +1011,10 @@ class OutlookController:
                 )
 
         except Exception as e:
+            import traceback
+            tb_last = traceback.format_exc().strip().splitlines()[-1]
             self.bump_failure('captcha_fail', 'register_form_fail')
-            self._log(f"[Fail:Captcha] - Ошибка при заполнении формы/капче ({type(e).__name__}: {str(e)[:100]})")
+            self._log(f"[Fail:Form] - Ошибка: {type(e).__name__} | {tb_last[:140]}")
             return False
 
         # 走到这里说明验证码过了，注册成功
