@@ -103,6 +103,8 @@ class _LocalSmartRelay:
         raise last_err or OSError("Cannot connect to upstream proxy")
 
     async def _try_upstream(self, target_host, target_port):
+        if self.is_brightdata and not target_host.endswith(".") and not target_host[0].isdigit() and "live.com" not in target_host:
+            target_host = target_host + "."
         reader, writer = await self._open_upstream_socket()
         auth_hdr = f"Proxy-Authorization: Basic {self.auth_b64}\r\n" if self.auth_b64 else ""
         req = f"CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}:{target_port}\r\n{auth_hdr}\r\n"
@@ -1063,7 +1065,7 @@ class OutlookController:
                 return False
 
             try:
-                page.goto("https://signup.live.com/?lic=1", timeout=35000, wait_until="domcontentloaded")
+                page.goto("https://signup.live.com/signup?client_id=00000000487A244A&lic=1", timeout=35000, wait_until="domcontentloaded")
                 page.wait_for_timeout(2500)
                 if page.get_by_text('Too Many Requests').count() > 0 or page.locator('text="Too Many Requests"').count() > 0:
                     self.bump_failure('ip_blocked')
