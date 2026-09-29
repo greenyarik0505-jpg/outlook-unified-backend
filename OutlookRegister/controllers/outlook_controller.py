@@ -3,9 +3,177 @@ import time
 import random
 import math
 import shutil
+import socket
+import base64
+import asyncio
 import threading
+from urllib.parse import urlparse
 from faker import Faker
 from patchright.sync_api import sync_playwright
+
+
+class _LocalSmartRelay:
+    """Thread-local HTTP CONNECT proxy relay with IP-tunnel rewrite, port fallback, and CDN bypass."""
+
+    def __init__(self, proxy_url):
+        p = urlparse(proxy_url)
+        self.up_host = p.hostname or ""
+        self.up_port = p.port or 8080
+        u = p.username or ""
+        pw = p.password or ""
+        auth_raw = f"{u}:{pw}"
+        self.auth_b64 = base64.b64encode(auth_raw.encode("utf-8")).decode("ascii") if u else ""
+        self.is_decodo = "decodo.com" in self.up_host.lower()
+        self.is_brightdata = "superproxy.io" in self.up_host.lower() or "brightdata" in self.up_host.lower()
+        self.loop = None
+        self.server = None
+        self.thread = None
+        self.local_port = 0
+        self._ready = threading.Event()
+
+    def start(self):
+        if self.local_port:
+            return f"http://127.0.0.1:{self.local_port}"
+
+        def _run():
+            try:
+                self.loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(self.loop)
+                self.server = self.loop.run_until_complete(
+                    asyncio.start_server(self._handle_client, "127.0.0.1", 0)
+                )
+                self.local_port = self.server.sockets[0].getsockname()[1]
+                self._ready.set()
+                self.loop.run_forever()
+            except Exception:
+                self._ready.set()
+            finally:
+                try:
+                    if self.server:
+                        self.server.close()
+                    if self.loop and not self.loop.is_closed():
+                        self.loop.close()
+                except Exception:
+                    pass
+
+        self.thread = threading.Thread(target=_run, daemon=True)
+        self.thread.start()
+        self._ready.wait(timeout=4)
+        return f"http://127.0.0.1:{self.local_port}" if self.local_port else ""
+
+    def stop(self):
+        try:
+            if self.loop and self.loop.is_running():
+                self.loop.call_soon_threadsafe(self.loop.stop)
+        except Exception:
+            pass
+
+    async def _pipe(self, reader, writer):
+        try:
+            while not reader.at_eof():
+                data = await reader.read(65536)
+                if not data:
+                    break
+                writer.write(data)
+                await writer.drain()
+        except Exception:
+            pass
+        finally:
+            try:
+                writer.close()
+            except Exception:
+                pass
+
+    async def _open_upstream_socket(self):
+        ports = [self.up_port]
+        if self.is_brightdata:
+            for alt_p in (22225, 33335, 44445):
+                if alt_p not in ports:
+                    ports.append(alt_p)
+        last_err = None
+        for p in ports:
+            try:
+                r, w = await asyncio.wait_for(
+                    asyncio.open_connection(self.up_host, p), timeout=7
+                )
+                self.up_port = p
+                return r, w
+            except Exception as e:
+                last_err = e
+        raise last_err or OSError("Cannot connect to upstream proxy")
+
+    async def _try_upstream(self, target_host, target_port):
+        reader, writer = await self._open_upstream_socket()
+        auth_hdr = f"Proxy-Authorization: Basic {self.auth_b64}\r\n" if self.auth_b64 else ""
+        req = f"CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}:{target_port}\r\n{auth_hdr}\r\n"
+        writer.write(req.encode("utf-8"))
+        await writer.drain()
+        resp = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=8)
+        status_line = resp.split(b"\r\n")[0].decode("utf-8", errors="replace")
+        if "200" in status_line:
+            return reader, writer
+        try:
+            writer.close()
+        except Exception:
+            pass
+        return None, None
+
+    async def _handle_client(self, client_reader, client_writer):
+        try:
+            header = await asyncio.wait_for(client_reader.readuntil(b"\r\n\r\n"), timeout=8)
+            first_line = header.split(b"\r\n")[0].decode("utf-8", errors="replace")
+            parts = first_line.split(" ")
+            if len(parts) < 2 or parts[0] != "CONNECT":
+                client_writer.close()
+                return
+            host, port = parts[1].rsplit(":", 1)
+            up_reader, up_writer = None, None
+
+            # Tier 1: Decodo blocks Microsoft auth domains by name, so connect via IPv4 first
+            if self.is_decodo:
+                try:
+                    ip = socket.gethostbyname(host)
+                    up_reader, up_writer = await self._try_upstream(ip, port)
+                except Exception:
+                    pass
+            if not up_reader:
+                try:
+                    up_reader, up_writer = await self._try_upstream(host, port)
+                except Exception:
+                    pass
+            # Tier 2: If hostname returned 403, try IPv4 tunnel
+            if not up_reader and not self.is_decodo:
+                try:
+                    ip = socket.gethostbyname(host)
+                    if ip != host:
+                        up_reader, up_writer = await self._try_upstream(ip, port)
+                except Exception:
+                    pass
+            # Tier 3: Direct fallback for blocked CDNs / risk / captcha subresources
+            if not up_reader and host != "signup.live.com":
+                try:
+                    up_reader, up_writer = await asyncio.wait_for(
+                        asyncio.open_connection(host, int(port)), timeout=8
+                    )
+                except Exception:
+                    pass
+
+            if up_reader and up_writer:
+                client_writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                await client_writer.drain()
+                await asyncio.gather(
+                    self._pipe(client_reader, up_writer),
+                    self._pipe(up_reader, client_writer),
+                )
+            else:
+                client_writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                await client_writer.drain()
+                client_writer.close()
+        except Exception:
+            try:
+                client_writer.close()
+            except Exception:
+                pass
 
 
 class OutlookController:
@@ -135,16 +303,29 @@ class OutlookController:
                 return cls._ip_info_cache[proxy_url]
         info = {'country': '??', 'timezone': 'UTC', 'loc': None}
         try:
+            import re
             import requests
-            r = requests.get('https://ipinfo.io/json', proxies={'http': proxy_url, 'https': proxy_url},
-                             timeout=6, headers={'Accept': 'application/json'})
-            if r.status_code == 200:
-                d = r.json()
-                info = {
-                    'country': d.get('country', '??'),
-                    'timezone': d.get('timezone', 'UTC'),
-                    'loc': d.get('loc', None),  # "35.68,139.76"
-                }
+            m_ip = re.search(r'-ip-(\d{1,3}(?:\.\d{1,3}){3})', proxy_url)
+            if m_ip:
+                target_ip = m_ip.group(1)
+                r = requests.get(f'https://ipinfo.io/{target_ip}/json', timeout=5, headers={'Accept': 'application/json'})
+                if r.status_code == 200:
+                    d = r.json()
+                    info = {
+                        'country': d.get('country', '??'),
+                        'timezone': d.get('timezone', 'UTC'),
+                        'loc': d.get('loc', None),
+                    }
+            if info['country'] == '??':
+                r = requests.get('https://ipinfo.io/json', proxies={'http': proxy_url, 'https': proxy_url},
+                                 timeout=6, headers={'Accept': 'application/json'})
+                if r.status_code == 200:
+                    d = r.json()
+                    info = {
+                        'country': d.get('country', '??'),
+                        'timezone': d.get('timezone', 'UTC'),
+                        'loc': d.get('loc', None),  # "35.68,139.76"
+                    }
         except Exception:
             pass
         with cls._state_lock:
@@ -157,7 +338,13 @@ class OutlookController:
                 self.failure_stats[name] = self.failure_stats.get(name, 0) + 1
 
     def _reset_thread_runtime(self):
-        for attr in ('_proxy', '_ip_info', '_log_prefix'):
+        relay = getattr(self.thread_local, '_proxy_relay', None)
+        if relay is not None:
+            try:
+                relay.stop()
+            except Exception:
+                pass
+        for attr in ('_proxy', '_ip_info', '_log_prefix', '_proxy_relay', '_proxy_spec'):
             if hasattr(self.thread_local, attr):
                 delattr(self.thread_local, attr)
 
@@ -364,6 +551,16 @@ class OutlookController:
             pass
 
     def _dispose_thread_browser(self):
+        relay = getattr(self.thread_local, '_proxy_relay', None)
+        if relay is not None:
+            try:
+                relay.stop()
+            except Exception:
+                pass
+            try:
+                delattr(self.thread_local, '_proxy_relay')
+            except Exception:
+                pass
         browser = getattr(self.thread_local, 'browser', None)
         if not browser:
             return
@@ -468,7 +665,7 @@ class OutlookController:
             proxy_url = ""
 
         # Dynamic session injection for rotating proxies (BrightData / superproxy.io)
-        if ('superproxy.io' in proxy_url or 'brightdata' in proxy_url) and '-session-' not in proxy_url:
+        if ('superproxy.io' in proxy_url or 'brightdata' in proxy_url) and '-session-' not in proxy_url and '-ip-' not in proxy_url:
             import uuid
             session_id = uuid.uuid4().hex[:8]
             try:
@@ -604,19 +801,31 @@ class OutlookController:
 
             proxy_spec = None
             if proxy_url and not proxy_url.endswith("://:0") and not proxy_url.endswith("://:"):
-                proxy_spec = {"server": proxy_url, "bypass": "localhost"}
-                if "@" in proxy_url:
+                old_relay = getattr(self.thread_local, '_proxy_relay', None)
+                if old_relay is not None:
                     try:
-                        from urllib.parse import urlparse
-                        parsed = urlparse(proxy_url)
-                        proxy_spec = {
-                            "server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}",
-                            "username": parsed.username or "",
-                            "password": parsed.password or "",
-                            "bypass": "localhost",
-                        }
+                        old_relay.stop()
                     except Exception:
                         pass
+                relay = _LocalSmartRelay(proxy_url)
+                local_relay_url = relay.start()
+                if local_relay_url:
+                    self.thread_local._proxy_relay = relay
+                    proxy_spec = {"server": local_relay_url, "bypass": "localhost,127.0.0.1"}
+                else:
+                    proxy_spec = {"server": proxy_url, "bypass": "localhost"}
+                    if "@" in proxy_url:
+                        try:
+                            from urllib.parse import urlparse
+                            parsed = urlparse(proxy_url)
+                            proxy_spec = {
+                                "server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}",
+                                "username": parsed.username or "",
+                                "password": parsed.password or "",
+                                "bypass": "localhost",
+                            }
+                        except Exception:
+                            pass
             self.thread_local._proxy_spec = proxy_spec
 
             common = {
@@ -741,9 +950,6 @@ class OutlookController:
                 context_opts['geolocation'] = {'latitude': float(lat), 'longitude': float(lng)}
             except Exception:
                 pass
-        proxy_spec = getattr(self.thread_local, '_proxy_spec', None)
-        if proxy_spec:
-            context_opts['proxy'] = proxy_spec
         context = None
         try:
             context = browser.new_context(**context_opts)
@@ -806,6 +1012,7 @@ class OutlookController:
                 delattr(self.thread_local, '_browser_profile_dir')
             if hasattr(self.thread_local, '_fingerprint_seed'):
                 delattr(self.thread_local, '_fingerprint_seed')
+            self._reset_thread_runtime()
             # 关掉浏览器后再清空整个 profiles 根目录（正常/异常收尾都走这里）
             try:
                 self.clear_browser_profiles_root(log=True)
@@ -835,7 +1042,6 @@ class OutlookController:
         for goto_attempt in range(2):
             def _dismiss_consent_dialog():
                 consent_selectors = [
-                    '#nextButton',
                     '[data-testid="primaryButton"]:has-text("同意")',
                     '[data-testid="primaryButton"]:has-text("Accept")',
                     '[data-testid="primaryButton"]:has-text("Agree")',
@@ -850,7 +1056,7 @@ class OutlookController:
                         el = page.locator(sel).first
                         if el.count() > 0 and el.is_visible():
                             el.click(timeout=3000)
-                            page.wait_for_timeout(800)
+                            page.wait_for_timeout(1200)
                             return True
                     except Exception:
                         pass
@@ -858,7 +1064,7 @@ class OutlookController:
 
             try:
                 page.goto("https://signup.live.com/?lic=1", timeout=35000, wait_until="domcontentloaded")
-                page.wait_for_timeout(2000)
+                page.wait_for_timeout(2500)
                 if page.get_by_text('Too Many Requests').count() > 0 or page.locator('text="Too Many Requests"').count() > 0:
                     self.bump_failure('ip_blocked')
                     self._log("[Fail:IP] - Превышен лимит запросов с этого IP (HTTP 429 Too Many Requests от Microsoft). Смените IP.")
